@@ -1,9 +1,7 @@
 import requests
 import time
 
-# Telegram configuration
-TELEGRAM_BOT_TOKEN = "qwe1211sdaadwadswadfwf" # Replace with your bot token
-TELEGRAM_CHAT_ID = "1234567890"  # Replace with the correct chat ID
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   # dari .env (bukan hardcoded)
 
 def send_telegram_message(message):
     """Send a notification to Telegram"""
@@ -24,7 +22,7 @@ if __name__ == "__main__":
     message = (
         "🔔 *Juniper Synchronization Notification*\n"
         "✅ Status: *Successful*\n"
-        "🔄 Synchronization between Master and Backup is complete!\n"
+        "🔄 `logical-systems` sync Master → Backup complete!\n"
         f"📅 Time: {current_time}"
     )
     send_telegram_message(message)

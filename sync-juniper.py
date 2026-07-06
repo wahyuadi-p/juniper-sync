@@ -2,65 +2,16 @@ import paramiko
 import time
 import subprocess
 
-# Juniper device configuration
-MASTER = {
-    "host": "192.168.100.21",
-    "username": "user",
-    "password": "password123"
-}
-BACKUP = {
-    "host": "192.168.100.22",
-    "username": "user",
-    "password": "password123"
-}
+from config import MASTER, BACKUP   # kredensial dari .env (bukan hardcoded)
 
-# Mandatory configuration
-MANDATORY_CONFIG = """
-system {
-    host-name RO-BACKUP;
-    root-authentication {
-        encrypted-password "$adwadwawdsdahkiuwal; ## SECRET-DATA
-    }
-    login {
-        user admin {
-            uid 2000;
-            class super-user;
-            authentication {
-                encrypted-password "$1$ydwaf/afawra0"; ## SECRET-DATA
-            }
-        }
-    }
-    services {
-        ssh;
-    }
-    syslog {
-        user * {
-            any emergency;
-        }
-        file messages {
-            any notice;
-            authorization info;
-        }
-        file interactive-commands {
-            interactive-commands any;
-        }
-    }
-}
-interfaces {
-    ge-0/0/0 {
-        unit 0 {
-            family inet {
-                address 192.168.100.22/24;
-            }
-        }
-    }
-}
-routing-options {
-    static {
-        route 0.0.0.0/0 next-hop 192.168.100.1;
-    }
-}
-"""
+# ---------------------------------------------------------------------------
+# MODE: SYNC HANYA `logical-systems`
+# Script mengambil HANYA stanza `logical-systems` dari Master, lalu di Backup
+# mengganti stanza itu saja (delete + load merge). Base config Backup (host-name,
+# interface manajemen, routing, dsb.) TIDAK disentuh — beda dari `load override`
+# yang menimpa seluruh konfigurasi.
+# ---------------------------------------------------------------------------
+
 
 def ssh_command(device, command):
     """Execute an SSH command and return the output."""
@@ -76,68 +27,57 @@ def ssh_command(device, command):
         print(f"❌ ERROR: Failed to connect to {device['host']}: {e}")
         return None
 
-def filter_config(config):
-    """Remove hostname and interface ge-0/0/0 from the Master configuration."""
-    new_config = []
-    skip_block = False
-    brace_count = 0
 
-    for line in config.splitlines():
-        if line.strip().startswith("host-name"):
-            continue
-        if "ge-0/0/0" in line:
-            skip_block = True
-            brace_count += line.count("{") - line.count("}")
-        elif skip_block:
-            brace_count += line.count("{") - line.count("}")
-            if brace_count <= 0:
-                skip_block = False
-            continue
+def fetch_logical_systems(device):
+    """Ambil HANYA stanza `logical-systems` dari perangkat.
 
-        if not skip_block:
-            new_config.append(line)
-    
-    return "\n".join(new_config)
+    `show configuration logical-systems` menampilkan ISI di bawah logical-systems
+    (tanpa pembungkus `logical-systems { }`), jadi hasilnya perlu dibungkus lagi
+    agar bisa di-`load` kembali sebagai file konfigurasi.
+    """
+    out = ssh_command(device, "show configuration logical-systems | no-more")
+    if out is None:
+        return None
+    return out.strip()
+
 
 def validate_config(config):
-    """Validate the configuration format before sending it to the device."""
+    """Validate the configuration format (kurung buka/tutup seimbang)."""
     open_braces = config.count("{")
     close_braces = config.count("}")
-    
     if open_braces != close_braces:
-        print(f"❌ ERROR: Configuration braces are not properly closed! {open_braces} '{'{'}' vs {close_braces} '{'}'}'")
+        print(f"❌ ERROR: Configuration braces are not properly closed! {open_braces} '{{' vs {close_braces} '}}'")
         return False
-    
     return True
 
-def sync_config():
-    """Synchronize configuration from Master to Backup using `load override`."""
-    print("📥 Fetching configuration from Master...")
-    master_config = ssh_command(MASTER, "show configuration | no-more")
 
-    if not master_config:
+def sync_config():
+    """Sinkronkan HANYA `logical-systems` dari Master ke Backup."""
+    print("📥 Fetching `logical-systems` configuration from Master...")
+    ls = fetch_logical_systems(MASTER)
+
+    if ls is None:
         print("❌ Failed to fetch configuration from Master.")
         return
+    if not ls:
+        print("⚠️  Master tidak punya `logical-systems` — tidak ada yang disync. Dibatalkan.")
+        return
 
-    # Filter out interface ge-0/0/0 and hostname
-    filtered_config = filter_config(master_config)
+    # Bungkus kembali isi stanza ke dalam `logical-systems { ... }` agar loadable.
+    final_config = "logical-systems {\n" + ls + "\n}\n"
 
-    # Merge with mandatory configuration
-    final_config = MANDATORY_CONFIG + "\n" + filtered_config
-
-    # Validate before sending to the backup device
+    # Validasi sebelum kirim ke Backup.
     if not validate_config(final_config):
         print("❌ Synchronization aborted due to incorrect configuration format.")
         return
 
-    # Save configuration to a temporary file
+    # Simpan ke file sementara.
     config_file = "final_config.txt"
     with open(config_file, "w") as file:
         file.write(final_config)
 
-    print("✅ Configuration validated successfully, sending to backup device...")
+    print("✅ `logical-systems` config validated, sending to backup device...")
 
-    # Send file to Backup device via SCP
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -149,28 +89,34 @@ def sync_config():
 
         print("📤 Configuration file successfully sent to Backup device.")
 
-        # Verify file contents on Backup before load override
+        # Verifikasi isi file di Backup sebelum diterapkan.
         print("🔍 Verifying file contents on Backup device...")
         remote_file_content = ssh_command(BACKUP, "cat /var/tmp/final_config.txt")
         print(f"📄 File contents:\n{remote_file_content}")
 
-        # Apply configuration with load override in an interactive session
-        print("🛠 Applying configuration with `load override`...")
+        # Terapkan HANYA stanza logical-systems:
+        #   delete logical-systems  → hapus yang lama di Backup
+        #   load merge <file>       → masukkan yang baru dari Master
+        # Sisa konfigurasi Backup tetap utuh. commit confirmed 5 = jaring pengaman
+        # (auto-rollback dalam 5 menit bila `commit` konfirmasi tak dijalankan).
+        print("🛠 Applying `logical-systems` (delete + load merge)...")
         ssh_interactive(BACKUP, [
             "configure",
-            "load override /var/tmp/final_config.txt",
+            "delete logical-systems",
+            "load merge /var/tmp/final_config.txt",
             "show | compare",
             "commit confirmed 5",
             "commit",
             "exit"
         ])
 
-        print("✅ Synchronization completed successfully!")
-        # Execute notification script if synchronization is successful
+        print("✅ `logical-systems` synchronization completed successfully!")
+        # Jalankan notifikasi bila sukses.
         subprocess.run(["python3", "notif.py"], check=True)
         client.close()
     except Exception as e:
         print(f"❌ ERROR: Failed to send configuration to Backup: {e}")
+
 
 def ssh_interactive(device, commands):
     """Execute an interactive SSH session for Juniper."""
@@ -191,6 +137,7 @@ def ssh_interactive(device, commands):
         client.close()
     except Exception as e:
         print(f"❌ ERROR: Failed to run interactive session: {e}")
+
 
 if __name__ == "__main__":
     sync_config()
