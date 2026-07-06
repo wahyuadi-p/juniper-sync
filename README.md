@@ -95,11 +95,32 @@ Before running the script, update the following variables directly in the source
 
 ## Usage
 
-Run the synchronization script:
+Run the synchronization script once:
 
 ```bash
 python3 sync-juniper.py
 ```
+
+### Auto-sync saat Master commit
+
+Mode **watch**: skrip memantau Master dan otomatis sync begitu ada **commit baru
+yang mengubah `logical-systems`** (tanpa perlu ubah konfigurasi router):
+
+```bash
+python3 sync-juniper.py --watch          # cek tiap 30 dtk (default)
+python3 sync-juniper.py --watch 10       # cek tiap 10 dtk
+# atau atur lewat .env: WATCH_INTERVAL=15
+```
+
+Cara kerja: tiap interval, skrip baca `show system commit`. Bila indeks commit
+teratas berubah **dan** hash `logical-systems` berbeda dari sync terakhir →
+jalankan sync. Baseline saat start tidak langsung disync (hanya commit
+berikutnya yang memicu). Hentikan dengan `Ctrl+C`.
+
+**Alternatif real-time (butuh setelan di router):**
+- **`event-options`** — event policy di Master pada event `UI_COMMIT_COMPLETED` menjalankan op-script sync.
+- **Syslog** — Master kirim syslog ke host; listener memicu sync saat lihat `UI_COMMIT_COMPLETED`.
+- **`transfer-on-commit`** — `set system archival configuration transfer-on-commit` mengunggah config tiap commit; file-watcher di host memicu sync.
 
 ### Expected Output
 

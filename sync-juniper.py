@@ -1,8 +1,18 @@
 import paramiko
 import time
 import subprocess
+import hashlib
+import sys
+import os
 
 from config import MASTER, BACKUP   # kredensial dari .env (bukan hardcoded)
+
+# Windows: console default cp1252 → emoji bikin UnicodeEncodeError. Paksa UTF-8.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 # ---------------------------------------------------------------------------
 # MODE: SYNC HANYA `logical-systems`
@@ -139,5 +149,64 @@ def ssh_interactive(device, commands):
         print(f"❌ ERROR: Failed to run interactive session: {e}")
 
 
+def get_latest_commit(device):
+    """Ambil baris commit TERBARU dari `show system commit` (indeks 0).
+
+    Dipakai mode --watch untuk mendeteksi commit baru di Master. Baris commit
+    diawali indeks angka, mis. `0   2026-07-06 14:00:00 UTC by user via cli`.
+    """
+    out = ssh_command(device, "show system commit | no-more")
+    if out is None:
+        return None
+    for line in out.splitlines():
+        s = line.strip()
+        if s and s[0].isdigit():
+            return s
+    return ""
+
+
+def watch_and_sync(interval):
+    """Pantau Master; begitu ada COMMIT BARU yang MENGUBAH logical-systems → sync.
+
+    Tak menyentuh router (murni polling via SSH). Baseline saat start TIDAK
+    langsung disync — hanya commit berikutnya yang memicu (biar tak kaget).
+    """
+    print(f"👀 Watch aktif — cek commit Master {MASTER['host']} tiap {interval} dtk. Ctrl+C untuk berhenti.")
+    last_commit = get_latest_commit(MASTER)
+    last_ls_hash = hashlib.sha256((fetch_logical_systems(MASTER) or "").encode()).hexdigest()
+    print(f"   Baseline commit: {last_commit or '(gagal baca — cek koneksi)'}")
+
+    while True:
+        try:
+            time.sleep(interval)
+            cur = get_latest_commit(MASTER)
+            if cur is None:
+                print("⚠️  Gagal baca commit Master (koneksi?) — coba lagi nanti.")
+                continue
+            if cur == last_commit:
+                continue                                   # belum ada commit baru
+            print(f"🔔 Commit baru di Master: {cur}")
+            last_commit = cur
+            # Hanya sync bila logical-systems benar-benar berubah.
+            ls = fetch_logical_systems(MASTER) or ""
+            h = hashlib.sha256(ls.encode()).hexdigest()
+            if h == last_ls_hash:
+                print("   `logical-systems` tak berubah sejak sync terakhir → skip.")
+                continue
+            sync_config()
+            last_ls_hash = h
+        except KeyboardInterrupt:
+            print("\n👋 Watch dihentikan.")
+            break
+        except Exception as e:
+            print(f"⚠️  watch error: {e}")
+
+
 if __name__ == "__main__":
-    sync_config()
+    # `python sync-juniper.py`            → sync sekali lalu keluar
+    # `python sync-juniper.py --watch [N]` → pantau, sync otomatis tiap Master commit
+    if len(sys.argv) > 1 and sys.argv[1] in ("--watch", "-w"):
+        interval = int(sys.argv[2]) if len(sys.argv) > 2 else int(os.getenv("WATCH_INTERVAL", "30"))
+        watch_and_sync(interval)
+    else:
+        sync_config()
