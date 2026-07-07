@@ -60,7 +60,7 @@ juniper-sync/
 2. **Create a virtual environment** (optional)
 
    ```bash
-   python3 -m venv venv
+   python -m venv venv
    source venv/bin/activate
    ```
 
@@ -98,8 +98,21 @@ Before running the script, update the following variables directly in the source
 Run the synchronization script once:
 
 ```bash
-python3 sync-juniper.py
+python sync-juniper.py
 ```
+
+### Sync periodik (tiap 1 jam)
+
+Mode **every**: skrip menjalankan sync **secara terjadwal** tiap N detik tanpa
+peduli ada commit baru atau tidak. Default 3600 detik = 1 jam:
+
+```bash
+python sync-juniper.py --every          # sync tiap 3600 dtk (1 jam, default)
+python sync-juniper.py --every 1800     # sync tiap 30 menit
+# atau atur lewat .env: SYNC_INTERVAL=3600
+```
+
+Hentikan dengan `Ctrl+C`.
 
 ### Auto-sync saat Master commit
 
@@ -107,8 +120,8 @@ Mode **watch**: skrip memantau Master dan otomatis sync begitu ada **commit baru
 yang mengubah `logical-systems`** (tanpa perlu ubah konfigurasi router):
 
 ```bash
-python3 sync-juniper.py --watch          # cek tiap 30 dtk (default)
-python3 sync-juniper.py --watch 10       # cek tiap 10 dtk
+python sync-juniper.py --watch          # cek tiap 30 dtk (default)
+python sync-juniper.py --watch 10       # cek tiap 10 dtk
 # atau atur lewat .env: WATCH_INTERVAL=15
 ```
 

@@ -122,7 +122,7 @@ def sync_config():
 
         print("✅ `logical-systems` synchronization completed successfully!")
         # Jalankan notifikasi bila sukses.
-        subprocess.run(["python3", "notif.py"], check=True)
+        subprocess.run(["python", "notif.py"], check=True)
         client.close()
     except Exception as e:
         print(f"❌ ERROR: Failed to send configuration to Backup: {e}")
@@ -202,11 +202,35 @@ def watch_and_sync(interval):
             print(f"⚠️  watch error: {e}")
 
 
+def run_every(interval):
+    """Jalankan sync_config() secara PERIODIK tiap `interval` detik (tanpa henti).
+
+    Beda dari --watch: mode ini sync SETIAP siklus tanpa peduli ada commit baru
+    atau tidak. Dipakai bila ingin sinkron terjadwal, mis. tiap 1 jam.
+    """
+    print(f"⏰ Sync periodik aktif — jalan tiap {interval} dtk. Ctrl+C untuk berhenti.")
+    while True:
+        try:
+            sync_config()
+            print(f"😴 Menunggu {interval} dtk sampai sync berikutnya...")
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            print("\n👋 Sync periodik dihentikan.")
+            break
+        except Exception as e:
+            print(f"⚠️  periodic sync error: {e}")
+            time.sleep(interval)
+
+
 if __name__ == "__main__":
-    # `python sync-juniper.py`            → sync sekali lalu keluar
+    # `python sync-juniper.py`             → sync sekali lalu keluar
     # `python sync-juniper.py --watch [N]` → pantau, sync otomatis tiap Master commit
+    # `python sync-juniper.py --every [N]` → sync PERIODIK tiap N dtk (default 3600 = 1 jam)
     if len(sys.argv) > 1 and sys.argv[1] in ("--watch", "-w"):
         interval = int(sys.argv[2]) if len(sys.argv) > 2 else int(os.getenv("WATCH_INTERVAL", "30"))
         watch_and_sync(interval)
+    elif len(sys.argv) > 1 and sys.argv[1] in ("--every", "-e"):
+        interval = int(sys.argv[2]) if len(sys.argv) > 2 else int(os.getenv("SYNC_INTERVAL", "3600"))
+        run_every(interval)
     else:
         sync_config()
