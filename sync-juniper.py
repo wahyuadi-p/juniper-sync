@@ -4,6 +4,7 @@ import subprocess
 import hashlib
 import sys
 import os
+from datetime import datetime
 
 from config import MASTER, BACKUP   # kredensial dari .env (bukan hardcoded)
 
@@ -61,9 +62,18 @@ def validate_config(config):
     return True
 
 
-def sync_config():
-    """Sinkronkan HANYA `logical-systems` dari Master ke Backup."""
-    print("📥 Fetching `logical-systems` configuration from Master...")
+def sync_config(full=False):
+    """Sinkronkan HANYA `logical-systems` dari Master ke Backup.
+
+    full=False (default, dipakai commit-trigger):
+        HANYA `load merge` → aditif. Perubahan & penambahan dari Master masuk,
+        tapi logical-system yang dihapus di Master TIDAK ikut hilang di Backup.
+    full=True (dipakai jadwal harian 00:00):
+        `delete logical-systems` + `load merge` → timpa penuh. Backup jadi
+        cerminan persis `logical-systems` Master (penghapusan ikut tercermin).
+    """
+    mode = "delete + load merge (full)" if full else "load merge (aditif)"
+    print(f"📥 Fetching `logical-systems` configuration from Master... [mode: {mode}]")
     ls = fetch_logical_systems(MASTER)
 
     if ls is None:
@@ -104,21 +114,24 @@ def sync_config():
         remote_file_content = ssh_command(BACKUP, "cat /var/tmp/final_config.txt")
         print(f"📄 File contents:\n{remote_file_content}")
 
-        # Terapkan HANYA stanza logical-systems:
-        #   delete logical-systems  → hapus yang lama di Backup
-        #   load merge <file>       → masukkan yang baru dari Master
-        # Sisa konfigurasi Backup tetap utuh. commit confirmed 5 = jaring pengaman
-        # (auto-rollback dalam 5 menit bila `commit` konfirmasi tak dijalankan).
-        print("🛠 Applying `logical-systems` (delete + load merge)...")
-        ssh_interactive(BACKUP, [
-            "configure",
-            "delete logical-systems",
+        # Terapkan HANYA stanza logical-systems. Sisa konfigurasi Backup
+        # (host-name, interface, routing, dsb.) SELALU tetap utuh.
+        #   full=True  → `delete logical-systems` + `load merge` (timpa penuh)
+        #   full=False → hanya `load merge` (aditif; hapusan di Master tak ikut)
+        # commit confirmed 5 = jaring pengaman (auto-rollback dalam 5 menit
+        # bila `commit` konfirmasi tak dijalankan).
+        apply_cmds = ["configure"]
+        if full:
+            apply_cmds.append("delete logical-systems")
+        apply_cmds += [
             "load merge /var/tmp/final_config.txt",
             "show | compare",
             "commit confirmed 5",
             "commit",
-            "exit"
-        ])
+            "exit",
+        ]
+        print(f"🛠 Applying `logical-systems` ({mode})...")
+        ssh_interactive(BACKUP, apply_cmds)
 
         print("✅ `logical-systems` synchronization completed successfully!")
         # Jalankan notifikasi bila sukses.
@@ -222,15 +235,85 @@ def run_every(interval):
             time.sleep(interval)
 
 
+def parse_daily_time(s):
+    """Parse 'HH:MM' -> (hour, minute). Fallback ke 00:00 kalau format salah."""
+    try:
+        hh, mm = s.strip().split(":")
+        return int(hh), int(mm)
+    except Exception:
+        print(f"⚠️  DAILY_SYNC_TIME '{s}' tidak valid, pakai default 00:00")
+        return 0, 0
+
+
+def auto_sync(interval, daily_time):
+    """Gabungan commit-trigger (seperti --watch) + jadwal harian jam tetap.
+
+    - Tiap `interval` detik, cek commit baru di Master → sync bila `logical-systems`
+      berubah (persis seperti --watch).
+    - Sekali sehari, begitu jam sistem melewati `daily_time` (format HH:MM, default
+      00:00 / tengah malam), paksa full sync sebagai jaring pengaman meski tak ada
+      commit baru. Jam bisa diubah kapan saja lewat .env (DAILY_SYNC_TIME) tanpa
+      ubah kode.
+    """
+    hour, minute = parse_daily_time(daily_time)
+    print(f"🤖 Auto-sync aktif — commit-trigger tiap {interval} dtk + jadwal harian jam {hour:02d}:{minute:02d}. Ctrl+C untuk berhenti.")
+    last_commit = get_latest_commit(MASTER)
+    last_ls_hash = hashlib.sha256((fetch_logical_systems(MASTER) or "").encode()).hexdigest()
+    last_daily_sync_date = None
+    print(f"   Baseline commit: {last_commit or '(gagal baca — cek koneksi)'}")
+
+    while True:
+        try:
+            time.sleep(interval)
+            now = datetime.now()
+
+            # --- Jadwal harian jam tetap (jaring pengaman) ---
+            scheduled_today = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if now >= scheduled_today and last_daily_sync_date != now.date():
+                print(f"⏰ Jadwal harian ({hour:02d}:{minute:02d}) tercapai — full sync (delete + load merge)...")
+                sync_config(full=True)
+                last_daily_sync_date = now.date()
+                last_commit = get_latest_commit(MASTER)
+                last_ls_hash = hashlib.sha256((fetch_logical_systems(MASTER) or "").encode()).hexdigest()
+                continue
+
+            # --- Commit-trigger (sama seperti --watch) ---
+            cur = get_latest_commit(MASTER)
+            if cur is None:
+                print("⚠️  Gagal baca commit Master (koneksi?) — coba lagi nanti.")
+                continue
+            if cur == last_commit:
+                continue                                   # belum ada commit baru
+            print(f"🔔 Commit baru di Master: {cur}")
+            last_commit = cur
+            ls = fetch_logical_systems(MASTER) or ""
+            h = hashlib.sha256(ls.encode()).hexdigest()
+            if h == last_ls_hash:
+                print("   `logical-systems` tak berubah sejak sync terakhir → skip.")
+                continue
+            sync_config(full=False)   # commit-trigger → hanya load merge (aditif)
+            last_ls_hash = h
+        except KeyboardInterrupt:
+            print("\n👋 Auto-sync dihentikan.")
+            break
+        except Exception as e:
+            print(f"⚠️  auto-sync error: {e}")
+
+
 if __name__ == "__main__":
     # `python sync-juniper.py`             → sync sekali lalu keluar
     # `python sync-juniper.py --watch [N]` → pantau, sync otomatis tiap Master commit
     # `python sync-juniper.py --every [N]` → sync PERIODIK tiap N dtk (default 3600 = 1 jam)
+    # `python sync-juniper.py --auto [N]`  → commit-trigger + jadwal harian jam tetap (DAILY_SYNC_TIME)
     if len(sys.argv) > 1 and sys.argv[1] in ("--watch", "-w"):
         interval = int(sys.argv[2]) if len(sys.argv) > 2 else int(os.getenv("WATCH_INTERVAL", "30"))
         watch_and_sync(interval)
     elif len(sys.argv) > 1 and sys.argv[1] in ("--every", "-e"):
         interval = int(sys.argv[2]) if len(sys.argv) > 2 else int(os.getenv("SYNC_INTERVAL", "3600"))
         run_every(interval)
+    elif len(sys.argv) > 1 and sys.argv[1] in ("--auto", "-a"):
+        interval = int(sys.argv[2]) if len(sys.argv) > 2 else int(os.getenv("WATCH_INTERVAL", "30"))
+        daily_time = os.getenv("DAILY_SYNC_TIME", "00:00")
+        auto_sync(interval, daily_time)
     else:
         sync_config()

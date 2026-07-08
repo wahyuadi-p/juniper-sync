@@ -130,6 +130,29 @@ teratas berubah **dan** hash `logical-systems` berbeda dari sync terakhir →
 jalankan sync. Baseline saat start tidak langsung disync (hanya commit
 berikutnya yang memicu). Hentikan dengan `Ctrl+C`.
 
+### Auto-sync gabungan (commit-trigger + jadwal harian jam tetap)
+
+Mode **auto**: gabungan mode **watch** di atas dengan jadwal sync harian di jam
+tetap (default tengah malam `00:00`) sebagai jaring pengaman — jadi tetap ada
+sync penuh sekali sehari meskipun tidak ada commit baru yang terdeteksi:
+
+```bash
+python sync-juniper.py --auto           # cek commit tiap 30 dtk (default) + sync jam 00:00
+python sync-juniper.py --auto 10        # cek commit tiap 10 dtk + sync jam 00:00
+# atau atur lewat .env: WATCH_INTERVAL=15
+```
+
+Jam sync harian diatur lewat `.env` (bisa diubah manual kapan saja, tanpa ubah kode):
+
+```bash
+DAILY_SYNC_TIME=00:00   # format HH:MM, 24 jam. Contoh lain: DAILY_SYNC_TIME=23:30
+```
+
+Cara kerja: tiap interval, skrip cek dua hal — (1) apakah jam sistem sudah
+melewati `DAILY_SYNC_TIME` dan belum sync di hari itu → jalankan full sync;
+kalau belum, (2) baru cek commit baru seperti mode `--watch`. Hentikan dengan
+`Ctrl+C`.
+
 **Alternatif real-time (butuh setelan di router):**
 - **`event-options`** — event policy di Master pada event `UI_COMMIT_COMPLETED` menjalankan op-script sync.
 - **Syslog** — Master kirim syslog ke host; listener memicu sync saat lihat `UI_COMMIT_COMPLETED`.
