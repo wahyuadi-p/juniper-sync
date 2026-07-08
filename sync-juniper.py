@@ -158,7 +158,7 @@ def sync_config(full=False):
 
         print("✅ `logical-systems` synchronization completed successfully!")
         # Jalankan notifikasi bila sukses.
-        subprocess.run(["python", "notif.py"], check=True)
+        subprocess.run(["python3", "notif.py"], check=True)
         client.close()
     except Exception as e:
         print(f"❌ ERROR: Failed to send configuration to Backup: {e}")
@@ -209,7 +209,7 @@ def sync_config_commit_trigger():
     print("🛠 Applying delta via `load patch`...")
     if apply_patch_to_backup(BACKUP, "/var/tmp/patch_config.txt", "delta patch"):
         print("✅ Delta `logical-systems` synchronization completed successfully!")
-        subprocess.run(["python", "notif.py"], check=True)
+        subprocess.run(["python3", "notif.py"], check=True)
     else:
         print("↩️  Patch gagal — fallback ke `load merge` full (aditif)...")
         sync_config(full=False)
