@@ -130,6 +130,27 @@ teratas berubah **dan** hash `logical-systems` berbeda dari sync terakhir →
 jalankan sync. Baseline saat start tidak langsung disync (hanya commit
 berikutnya yang memicu). Hentikan dengan `Ctrl+C`.
 
+#### Commit-trigger mengirim DELTA saja (`load patch`)
+
+Saat commit-trigger (`--watch` / `--auto`) mendeteksi perubahan, yang dikirim ke
+Backup **hanya baris yang berubah** — bukan seluruh stanza `logical-systems`.
+Skrip mengambil delta dari Master via `show configuration logical-systems |
+compare rollback 1` (format patch, header absolut) lalu menerapkannya di Backup
+dengan `load patch`.
+
+Bila patch **ditolak** (konteks Backup sudah _drift_ dari Master), skrip otomatis
+**fallback** ke `load merge` full (kirim seluruh stanza, aditif) yang lebih tahan
+drift. Diatur lewat `.env`:
+
+```bash
+COMMIT_TRIGGER_MODE=patch   # default: kirim delta via load patch (+fallback merge)
+COMMIT_TRIGGER_MODE=merge   # perilaku lama: kirim seluruh stanza + load merge
+```
+
+> Catatan: `rollback 1` hanya menangkap **1 commit terakhir**. Bila ada 2+ commit
+> di antara dua polling, sebagian delta bisa terlewat di jalur patch — inilah
+> gunanya **jadwal harian full sync** (`--auto`) sebagai jaring pengaman.
+
 ### Auto-sync gabungan (commit-trigger + jadwal harian jam tetap)
 
 Mode **auto**: gabungan mode **watch** di atas dengan jadwal sync harian di jam

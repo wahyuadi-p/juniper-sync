@@ -6,7 +6,7 @@ import sys
 import os
 from datetime import datetime
 
-from config import MASTER, BACKUP   # kredensial dari .env (bukan hardcoded)
+from config import MASTER, BACKUP, COMMIT_TRIGGER_MODE   # kredensial & opsi dari .env (bukan hardcoded)
 
 # Windows: console default cp1252 → emoji bikin UnicodeEncodeError. Paksa UTF-8.
 try:
@@ -47,6 +47,29 @@ def fetch_logical_systems(device):
     agar bisa di-`load` kembali sebagai file konfigurasi.
     """
     out = ssh_command(device, "show configuration logical-systems | no-more")
+    if out is None:
+        return None
+    return out.strip()
+
+
+def fetch_logical_systems_patch(device):
+    """Ambil DELTA `logical-systems` dari commit TERAKHIR sebagai patch.
+
+    `show configuration logical-systems | compare rollback 1` menghasilkan diff
+    format patch dengan header ABSOLUT (mis. `[edit logical-systems BGP-BGP
+    interfaces]`) — bisa langsung dimakan `load patch` di Backup, sehingga yang
+    dikirim & diterapkan HANYA baris yang berubah (bukan seluruh stanza).
+
+    Batasan: `rollback 1` hanya menangkap 1 commit terakhir. Bila ada 2+ commit
+    di antara dua polling, delta commit sebelumnya bisa terlewat — dikoreksi
+    oleh jadwal harian full sync (`--auto`).
+
+    Return:
+        str  → blok patch (di-strip)
+        ""   → commit terakhir tak menyentuh logical-systems (tak ada delta)
+        None → gagal koneksi ke Master
+    """
+    out = ssh_command(device, "show configuration logical-systems | compare rollback 1 | no-more")
     if out is None:
         return None
     return out.strip()
@@ -141,6 +164,57 @@ def sync_config(full=False):
         print(f"❌ ERROR: Failed to send configuration to Backup: {e}")
 
 
+def sync_config_commit_trigger():
+    """Sync commit-trigger: kirim DELTA saja via `load patch`, fallback ke merge.
+
+    Dipakai oleh --watch dan --auto saat mendeteksi commit baru. Hanya baris yang
+    berubah (delta commit terakhir) yang dikirim & diterapkan ke Backup. Bila
+    `load patch` ditolak (Backup drift) → fallback ke `sync_config(full=False)`
+    (kirim seluruh stanza + `load merge`, aditif) yang lebih tahan drift.
+
+    Bila COMMIT_TRIGGER_MODE != "patch", langsung pakai perilaku lama (merge).
+    """
+    if COMMIT_TRIGGER_MODE != "patch":
+        print(f"⚙️  COMMIT_TRIGGER_MODE={COMMIT_TRIGGER_MODE} → pakai load merge (perilaku lama).")
+        sync_config(full=False)
+        return
+
+    print("📥 Fetching DELTA `logical-systems` from Master... [mode: load patch (delta)]")
+    patch = fetch_logical_systems_patch(MASTER)
+
+    if patch is None:
+        print("❌ Failed to fetch delta from Master.")
+        return
+    if not patch:
+        print("⚠️  Commit terakhir tak menyentuh `logical-systems` — tak ada delta. Skip.")
+        return
+
+    # Simpan patch ke file sementara.
+    patch_file = "patch_config.txt"
+    with open(patch_file, "w") as file:
+        file.write(patch + "\n")
+
+    print(f"✅ Delta patch siap ({len(patch.splitlines())} baris), mengirim ke Backup...")
+
+    if not sftp_put(BACKUP, patch_file, "/var/tmp/patch_config.txt"):
+        print("❌ Gagal kirim patch ke Backup.")
+        return
+    print("📤 Patch file successfully sent to Backup device.")
+
+    # Verifikasi isi patch di Backup sebelum diterapkan.
+    print("🔍 Verifying patch contents on Backup device...")
+    remote_patch = ssh_command(BACKUP, "cat /var/tmp/patch_config.txt")
+    print(f"📄 Patch contents:\n{remote_patch}")
+
+    print("🛠 Applying delta via `load patch`...")
+    if apply_patch_to_backup(BACKUP, "/var/tmp/patch_config.txt", "delta patch"):
+        print("✅ Delta `logical-systems` synchronization completed successfully!")
+        subprocess.run(["python", "notif.py"], check=True)
+    else:
+        print("↩️  Patch gagal — fallback ke `load merge` full (aditif)...")
+        sync_config(full=False)
+
+
 def ssh_interactive(device, commands):
     """Execute an interactive SSH session for Juniper."""
     try:
@@ -160,6 +234,77 @@ def ssh_interactive(device, commands):
         client.close()
     except Exception as e:
         print(f"❌ ERROR: Failed to run interactive session: {e}")
+
+
+def sftp_put(device, local_path, remote_path):
+    """Kirim satu file lokal ke perangkat via SFTP. Return True bila sukses."""
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(device["host"], username=device["username"], password=device["password"], timeout=10)
+        sftp = client.open_sftp()
+        sftp.put(local_path, remote_path)
+        sftp.close()
+        client.close()
+        return True
+    except Exception as e:
+        print(f"❌ ERROR: Failed to SFTP file to {device['host']}: {e}")
+        return False
+
+
+def apply_patch_to_backup(device, remote_path, mode_label):
+    """Terapkan patch delta di Backup via `load patch`, dengan branching aman.
+
+    Beda dari `ssh_interactive` (kirim semua command sekaligus): di sini kita
+    membaca output `load patch` DULU. Bila konteks Backup drift, `load patch`
+    menolak dengan `error:` — kita `rollback` & keluar TANPA commit, lalu return
+    False agar pemanggil bisa fallback ke `load merge` full.
+
+    Return True bila patch diterapkan & di-commit; False bila gagal (tak commit).
+    """
+    def drain(channel, wait=2):
+        """Tunggu sebentar lalu baca semua output yang tersedia."""
+        time.sleep(wait)
+        buf = ""
+        while channel.recv_ready():
+            buf += channel.recv(65535).decode("utf-8")
+        return buf
+
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(device["host"], username=device["username"], password=device["password"], timeout=10)
+        channel = client.invoke_shell()
+        drain(channel, 1)  # buang banner login
+
+        channel.send("configure\n")
+        print(f"Output [configure]:\n{drain(channel)}")
+
+        channel.send(f"load patch {remote_path}\n")
+        load_out = drain(channel)
+        print(f"Output [load patch]:\n{load_out}")
+
+        if "error" in load_out.lower():
+            # Patch ditolak (konteks tak cocok) → bersihkan & keluar tanpa commit.
+            print("⚠️  `load patch` ditolak (Backup drift?) — rollback, akan fallback ke load merge.")
+            channel.send("rollback\n")
+            print(f"Output [rollback]:\n{drain(channel)}")
+            channel.send("exit\n")
+            drain(channel, 1)
+            channel.close()
+            client.close()
+            return False
+
+        for cmd in ["show | compare", "commit confirmed 5", "commit", "exit"]:
+            channel.send(cmd + "\n")
+            print(f"Output [{cmd}]:\n{drain(channel)}")
+
+        channel.close()
+        client.close()
+        return True
+    except Exception as e:
+        print(f"❌ ERROR: Failed to apply patch ({mode_label}) to Backup: {e}")
+        return False
 
 
 def get_latest_commit(device):
@@ -206,7 +351,7 @@ def watch_and_sync(interval):
             if h == last_ls_hash:
                 print("   `logical-systems` tak berubah sejak sync terakhir → skip.")
                 continue
-            sync_config()
+            sync_config_commit_trigger()   # kirim delta (load patch), fallback merge
             last_ls_hash = h
         except KeyboardInterrupt:
             print("\n👋 Watch dihentikan.")
@@ -291,7 +436,7 @@ def auto_sync(interval, daily_time):
             if h == last_ls_hash:
                 print("   `logical-systems` tak berubah sejak sync terakhir → skip.")
                 continue
-            sync_config(full=False)   # commit-trigger → hanya load merge (aditif)
+            sync_config_commit_trigger()   # commit-trigger → delta (load patch), fallback merge
             last_ls_hash = h
         except KeyboardInterrupt:
             print("\n👋 Auto-sync dihentikan.")

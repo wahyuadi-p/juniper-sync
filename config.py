@@ -33,3 +33,11 @@ BACKUP = {
 }
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# Cara commit-trigger (--watch / --auto) mengirim perubahan ke Backup:
+#   "patch" (default) → kirim DELTA saja via `load patch` (show | compare
+#                       rollback 1); fallback otomatis ke load merge full bila
+#                       patch ditolak (Backup drift).
+#   "merge"           → perilaku lama: kirim seluruh stanza logical-systems
+#                       lalu `load merge` (aditif).
+COMMIT_TRIGGER_MODE = os.getenv("COMMIT_TRIGGER_MODE", "patch").strip().lower()
