@@ -228,23 +228,30 @@ def push_config(device, load_kind, content, pre_cmds=None, remote_path="/var/tmp
         return buf
 
     use_sftp = TRANSFER_MODE != "terminal"
+
+    # --- Mode SFTP: upload file lewat KONEKSI TERPISAH yang ditutup penuh. ---
+    # Junos sering menolak channel shell kedua di koneksi yang sama setelah SFTP
+    # (`open failed: Connect failed`). Jadi upload di koneksi sendiri, tutup, baru
+    # buka koneksi baru untuk shell.
+    if use_sftp:
+        try:
+            up = paramiko.SSHClient()
+            up.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            up.connect(device["host"], port=device.get("port", 22), username=device["username"], password=device["password"], timeout=10)
+            sftp = up.open_sftp()
+            with sftp.open(remote_path, "w") as rf:
+                rf.write(content if content.endswith("\n") else content + "\n")
+            sftp.close()
+            up.close()
+            print(f"📤 Config terkirim via SFTP → {device['host']}:{remote_path}")
+        except Exception as e:
+            print(f"❌ ERROR: SFTP gagal ({e}). Pastikan `sftp-server` aktif atau set TRANSFER_MODE=terminal.")
+            return False
+
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(device["host"], port=device.get("port", 22), username=device["username"], password=device["password"], timeout=10)
-
-        # --- Mode SFTP: upload file dulu, lalu `load merge <file>` (dari shell). ---
-        if use_sftp:
-            try:
-                sftp = client.open_sftp()
-                with sftp.open(remote_path, "w") as rf:
-                    rf.write(content if content.endswith("\n") else content + "\n")
-                sftp.close()
-                print(f"📤 Config terkirim via SFTP → {device['host']}:{remote_path}")
-            except Exception as e:
-                print(f"❌ ERROR: SFTP gagal ({e}). Pastikan `sftp-server` aktif atau set TRANSFER_MODE=terminal.")
-                client.close()
-                return False
 
         channel = client.invoke_shell()
         drain(channel, 1)  # buang banner login
@@ -331,7 +338,7 @@ def push_config(device, load_kind, content, pre_cmds=None, remote_path="/var/tmp
         client.close()
         return True
     except Exception as e:
-        print(f"❌ ERROR: Failed to push config via terminal to {device['host']}: {e}")
+        print(f"❌ ERROR: Failed to push config to {device['host']}: {e}")
         return False
 
 
