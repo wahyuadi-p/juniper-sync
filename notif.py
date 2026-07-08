@@ -11,7 +11,13 @@ def send_telegram_message(message):
         "text": message,
         "parse_mode": "Markdown"
     }
-    response = requests.post(url, data=payload)
+    try:
+        response = requests.post(url, data=payload, timeout=10)
+    except requests.exceptions.RequestException as e:
+        # Server tanpa rute internet / Telegram diblok → jangan lempar traceback.
+        # Notifikasi gagal bukan kegagalan sync; cukup warning.
+        print(f"⚠️  Tidak bisa kirim Telegram (jaringan?): {e}")
+        return
     if response.status_code == 200:
         print("✅ Notification sent to Telegram!")
     else:

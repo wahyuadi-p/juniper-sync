@@ -133,7 +133,13 @@ def sync_config(full=False):
     if push_config(BACKUP, "merge", final_config, pre_cmds):
         print("✅ `logical-systems` synchronization completed successfully!")
         # Jalankan notifikasi bila sukses.
-        subprocess.run(["python3", "notif.py"], check=True)
+        # Notifikasi bersifat best-effort: sync SUDAH sukses di titik ini, jadi
+        # kegagalan kirim Telegram (server tanpa internet, dll.) TAK BOLEH bikin
+        # program crash. check=False + try/except → cukup warning.
+        try:
+            subprocess.run(["python3", "notif.py"], check=False)
+        except Exception as e:
+            print(f"⚠️  Notifikasi dilewati (gagal jalankan notif.py): {e}")
     else:
         print("❌ ERROR: Failed to apply configuration to Backup.")
 
@@ -169,7 +175,13 @@ def sync_config_commit_trigger():
     print("🛠 Applying delta via `load patch`...")
     if push_config(BACKUP, "patch", patch):
         print("✅ Delta `logical-systems` synchronization completed successfully!")
-        subprocess.run(["python3", "notif.py"], check=True)
+        # Notifikasi bersifat best-effort: sync SUDAH sukses di titik ini, jadi
+        # kegagalan kirim Telegram (server tanpa internet, dll.) TAK BOLEH bikin
+        # program crash. check=False + try/except → cukup warning.
+        try:
+            subprocess.run(["python3", "notif.py"], check=False)
+        except Exception as e:
+            print(f"⚠️  Notifikasi dilewati (gagal jalankan notif.py): {e}")
     else:
         print("↩️  Patch ditolak (Backup drift?) — fallback ke `load merge` full (aditif)...")
         sync_config(full=False)
@@ -291,7 +303,9 @@ def push_config(device, load_kind, content, pre_cmds=None, remote_path="/var/tmp
             channel.send("\x04")
 
         # Tunggu sampai Junos konfirmasi hasil load (atau diam) — bukan hitungan tetap.
-        load_out = read_until(channel, ["load complete", "error", "syntax error", "unknown command"])
+        # idle besar: pada config besar perangkat bisa DIAM >3 dtk sambil parsing,
+        # jadi jangan bailout dini (nanti hasil nyusul & bikin output bergeser).
+        load_out = read_until(channel, ["load complete", "error", "syntax error", "unknown command"], timeout=120, idle=20)
         print(f"Output [{load_cmd}]:\n{load_out}")
 
         low = load_out.lower()
@@ -312,10 +326,12 @@ def push_config(device, load_kind, content, pre_cmds=None, remote_path="/var/tmp
         # berikutnya gagal terkirim, Junos auto-rollback dalam 5 menit sehingga
         # Backup tak tertinggal dalam kondisi setengah jadi.
         channel.send("show | compare\n")
-        print(f"Output [show | compare]:\n{read_until(channel, ['[edit]'])}")
+        print(f"Output [show | compare]:\n{read_until(channel, ['[edit]'], timeout=60, idle=15)}")
 
+        # idle besar: `commit check` pada config besar bisa hening beberapa detik
+        # sebelum mencetak 'configuration check succeeds'. Jangan menyerah dini.
         channel.send("commit check\n")
-        check_out = read_until(channel, ["configuration check succeeds", "check-out failed", "error"])
+        check_out = read_until(channel, ["configuration check succeeds", "check-out failed", "error"], timeout=120, idle=20)
         print(f"Output [commit check]:\n{check_out}")
         if "error" in check_out.lower() or "check-out failed" in check_out.lower():
             print("⚠️  `commit check` gagal — rollback, tanpa commit.")
@@ -327,12 +343,45 @@ def push_config(device, load_kind, content, pre_cmds=None, remote_path="/var/tmp
             client.close()
             return False
 
+        # `commit confirmed 5` = jaring pengaman: Junos auto-rollback dalam 5 mnt
+        # bila `commit` konfirmasi berikut tak terkirim. Pada config besar commit
+        # bisa >45 dtk, jadi timeout dinaikkan; 'another commit is in progress'
+        # dianggap GAGAL karena berarti konfirmasi belum tentu masuk.
         channel.send("commit confirmed 5\n")
-        print(f"Output [commit confirmed 5]:\n{read_until(channel, ['commit confirmed', 'commit complete', 'error'])}")
+        cc_out = read_until(channel, ["commit complete", "error", "another commit"], timeout=180, idle=25)
+        print(f"Output [commit confirmed 5]:\n{cc_out}")
+        low_cc = cc_out.lower()
+        if "commit complete" not in low_cc or "error" in low_cc or "another commit" in low_cc:
+            print("⚠️  `commit confirmed 5` tak konfirmasi 'commit complete' — rollback, tanpa commit.")
+            channel.send("rollback\n")
+            print(f"Output [rollback]:\n{drain(channel)}")
+            channel.send("exit\n")
+            drain(channel, 1)
+            channel.close()
+            client.close()
+            return False
+
+        # Jadikan PERMANEN. Beri jeda agar commit-confirmed benar-benar selesai
+        # (hindari 'another commit is in progress'), lalu WAJIB verifikasi
+        # 'commit complete'. Bila tak terverifikasi, JANGAN klaim sukses — Junos
+        # akan auto-rollback dalam 5 mnt dan config hilang tanpa disadari.
+        time.sleep(3)
         channel.send("commit\n")
-        print(f"Output [commit]:\n{read_until(channel, ['commit complete', 'error'])}")
+        commit_out = read_until(channel, ["commit complete", "error", "another commit"], timeout=180, idle=25)
+        print(f"Output [commit]:\n{commit_out}")
+        low_commit = commit_out.lower()
+        if "commit complete" not in low_commit or "error" in low_commit or "another commit" in low_commit:
+            print("❌ Konfirmasi `commit` TAK terverifikasi — Backup akan auto-rollback dalam 5 mnt. Dianggap GAGAL.")
+            channel.send("exit\n")
+            drain(channel, 1)
+            channel.close()
+            client.close()
+            return False
+
+        # Beri waktu commit permanen tuntas sebelum menutup channel, supaya
+        # `exit`/close tak memotong proses commit yang masih berjalan.
         channel.send("exit\n")
-        drain(channel, 1)
+        drain(channel, 2)
 
         channel.close()
         client.close()
