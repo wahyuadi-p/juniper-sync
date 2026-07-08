@@ -29,7 +29,7 @@ def ssh_command(device, command):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        client.connect(device["host"], username=device["username"], password=device["password"], timeout=10)
+        client.connect(device["host"], port=device.get("port", 22), username=device["username"], password=device["password"], timeout=10)
         stdin, stdout, stderr = client.exec_command(command)
         output = stdout.read().decode("utf-8")
         client.close()
@@ -124,7 +124,7 @@ def sync_config(full=False):
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(BACKUP["host"], username=BACKUP["username"], password=BACKUP["password"], timeout=10)
+        client.connect(BACKUP["host"], port=BACKUP.get("port", 22), username=BACKUP["username"], password=BACKUP["password"], timeout=10)
 
         sftp = client.open_sftp()
         sftp.put(config_file, "/var/tmp/final_config.txt")
@@ -220,7 +220,7 @@ def ssh_interactive(device, commands):
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(device["host"], username=device["username"], password=device["password"], timeout=10)
+        client.connect(device["host"], port=device.get("port", 22), username=device["username"], password=device["password"], timeout=10)
         channel = client.invoke_shell()
 
         for cmd in commands:
@@ -241,7 +241,7 @@ def sftp_put(device, local_path, remote_path):
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(device["host"], username=device["username"], password=device["password"], timeout=10)
+        client.connect(device["host"], port=device.get("port", 22), username=device["username"], password=device["password"], timeout=10)
         sftp = client.open_sftp()
         sftp.put(local_path, remote_path)
         sftp.close()
@@ -273,7 +273,7 @@ def apply_patch_to_backup(device, remote_path, mode_label):
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(device["host"], username=device["username"], password=device["password"], timeout=10)
+        client.connect(device["host"], port=device.get("port", 22), username=device["username"], password=device["password"], timeout=10)
         channel = client.invoke_shell()
         drain(channel, 1)  # buang banner login
 

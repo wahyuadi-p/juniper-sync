@@ -25,11 +25,13 @@ MASTER = {
     "host": os.getenv("MASTER_HOST", ""),
     "username": os.getenv("MASTER_USER", ""),
     "password": os.getenv("MASTER_PASS", ""),
+    "port": int(os.getenv("MASTER_PORT", "22")),
 }
 BACKUP = {
     "host": os.getenv("BACKUP_HOST", ""),
     "username": os.getenv("BACKUP_USER", ""),
     "password": os.getenv("BACKUP_PASS", ""),
+    "port": int(os.getenv("BACKUP_PORT", "22")),
 }
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
