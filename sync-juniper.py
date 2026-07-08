@@ -6,7 +6,7 @@ import sys
 import os
 from datetime import datetime
 
-from config import MASTER, BACKUP, COMMIT_TRIGGER_MODE   # kredensial & opsi dari .env (bukan hardcoded)
+from config import MASTER, BACKUP, COMMIT_TRIGGER_MODE, TRANSFER_MODE   # kredensial & opsi dari .env (bukan hardcoded)
 
 # Windows: console default cp1252 → emoji bikin UnicodeEncodeError. Paksa UTF-8.
 try:
@@ -114,54 +114,28 @@ def sync_config(full=False):
         print("❌ Synchronization aborted due to incorrect configuration format.")
         return
 
-    # Simpan ke file sementara.
-    config_file = "final_config.txt"
-    with open(config_file, "w") as file:
+    # Simpan salinan lokal (audit/debug). TIDAK dikirim ke Backup — pengiriman
+    # kini via `load merge terminal` (paste langsung), bukan transfer file.
+    with open("final_config.txt", "w") as file:
         file.write(final_config)
 
     print("✅ `logical-systems` config validated, sending to backup device...")
 
-    try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(BACKUP["host"], port=BACKUP.get("port", 22), username=BACKUP["username"], password=BACKUP["password"], timeout=10)
-
-        sftp = client.open_sftp()
-        sftp.put(config_file, "/var/tmp/final_config.txt")
-        sftp.close()
-
-        print("📤 Configuration file successfully sent to Backup device.")
-
-        # Verifikasi isi file di Backup sebelum diterapkan.
-        print("🔍 Verifying file contents on Backup device...")
-        remote_file_content = ssh_command(BACKUP, "cat /var/tmp/final_config.txt")
-        print(f"📄 File contents:\n{remote_file_content}")
-
-        # Terapkan HANYA stanza logical-systems. Sisa konfigurasi Backup
-        # (host-name, interface, routing, dsb.) SELALU tetap utuh.
-        #   full=True  → `delete logical-systems` + `load merge` (timpa penuh)
-        #   full=False → hanya `load merge` (aditif; hapusan di Master tak ikut)
-        # commit confirmed 5 = jaring pengaman (auto-rollback dalam 5 menit
-        # bila `commit` konfirmasi tak dijalankan).
-        apply_cmds = ["configure"]
-        if full:
-            apply_cmds.append("delete logical-systems")
-        apply_cmds += [
-            "load merge /var/tmp/final_config.txt",
-            "show | compare",
-            "commit confirmed 5",
-            "commit",
-            "exit",
-        ]
-        print(f"🛠 Applying `logical-systems` ({mode})...")
-        ssh_interactive(BACKUP, apply_cmds)
-
+    # Kirim & terapkan HANYA stanza logical-systems (via SFTP/terminal sesuai
+    # TRANSFER_MODE). Sisa konfigurasi Backup (host-name, interface, routing,
+    # dsb.) SELALU tetap utuh.
+    #   full=True  → `delete logical-systems` + load merge (timpa penuh)
+    #   full=False → load merge saja (aditif; hapusan di Master tak ikut)
+    # commit confirmed 5 = jaring pengaman (auto-rollback dalam 5 menit bila
+    # `commit` konfirmasi tak dijalankan).
+    pre_cmds = ["delete logical-systems"] if full else []
+    print(f"🛠 Applying `logical-systems` ({mode}) via {TRANSFER_MODE}...")
+    if push_config(BACKUP, "merge", final_config, pre_cmds):
         print("✅ `logical-systems` synchronization completed successfully!")
         # Jalankan notifikasi bila sukses.
         subprocess.run(["python3", "notif.py"], check=True)
-        client.close()
-    except Exception as e:
-        print(f"❌ ERROR: Failed to send configuration to Backup: {e}")
+    else:
+        print("❌ ERROR: Failed to apply configuration to Backup.")
 
 
 def sync_config_commit_trigger():
@@ -189,30 +163,176 @@ def sync_config_commit_trigger():
         print("⚠️  Commit terakhir tak menyentuh `logical-systems` — tak ada delta. Skip.")
         return
 
-    # Simpan patch ke file sementara.
-    patch_file = "patch_config.txt"
-    with open(patch_file, "w") as file:
-        file.write(patch + "\n")
+    print(f"✅ Delta patch siap ({len(patch.splitlines())} baris), mengirim ke Backup via {TRANSFER_MODE}...")
 
-    print(f"✅ Delta patch siap ({len(patch.splitlines())} baris), mengirim ke Backup...")
-
-    if not sftp_put(BACKUP, patch_file, "/var/tmp/patch_config.txt"):
-        print("❌ Gagal kirim patch ke Backup.")
-        return
-    print("📤 Patch file successfully sent to Backup device.")
-
-    # Verifikasi isi patch di Backup sebelum diterapkan.
-    print("🔍 Verifying patch contents on Backup device...")
-    remote_patch = ssh_command(BACKUP, "cat /var/tmp/patch_config.txt")
-    print(f"📄 Patch contents:\n{remote_patch}")
-
+    # Kirim delta via `load patch` (SFTP/terminal sesuai TRANSFER_MODE).
     print("🛠 Applying delta via `load patch`...")
-    if apply_patch_to_backup(BACKUP, "/var/tmp/patch_config.txt", "delta patch"):
+    if push_config(BACKUP, "patch", patch):
         print("✅ Delta `logical-systems` synchronization completed successfully!")
         subprocess.run(["python3", "notif.py"], check=True)
     else:
-        print("↩️  Patch gagal — fallback ke `load merge` full (aditif)...")
+        print("↩️  Patch ditolak (Backup drift?) — fallback ke `load merge` full (aditif)...")
         sync_config(full=False)
+
+
+def push_config(device, load_kind, content, pre_cmds=None, remote_path="/var/tmp/juniper_sync_load.txt"):
+    """Kirim & terapkan config ke perangkat, via SFTP atau terminal (TRANSFER_MODE).
+
+    load_kind : "merge" atau "patch".
+    content   : teks config/patch yang akan di-load.
+    pre_cmds  : perintah configure sebelum load (mis. ["delete logical-systems"]).
+    remote_path: path file di perangkat saat mode SFTP.
+
+    Mode transfer:
+      sftp     → upload file via SFTP lalu `load merge <file>`. Andal untuk config
+                 besar (tak ada korupsi paste). Butuh sftp-server aktif di Backup.
+      terminal → paste isi via `load merge terminal` baris-demi-baris. Fallback
+                 bila SFTP tak tersedia.
+
+    Bagian commit (show|compare → commit check → commit confirmed 5 → commit) SAMA
+    untuk kedua mode. Return True bila di-commit; False bila gagal (tanpa commit).
+    """
+    def drain(channel, wait=2):
+        time.sleep(wait)
+        buf = ""
+        while channel.recv_ready():
+            buf += channel.recv(65535).decode("utf-8")
+        return buf
+
+    def read_until(channel, markers, timeout=45, idle=3):
+        """Baca sampai salah satu `markers` muncul, ATAU channel diam `idle` dtk.
+
+        Lebih andal daripada tunggu-tetap: pada config besar echo bisa lama, jadi
+        kita berhenti hanya saat penanda hasil terlihat atau perangkat benar-benar
+        diam. `timeout` = batas keras total agar tak menggantung selamanya.
+        """
+        buf = ""
+        waited = 0.0
+        quiet = 0.0
+        while waited < timeout:
+            time.sleep(0.5)
+            waited += 0.5
+            chunk = ""
+            while channel.recv_ready():
+                chunk += channel.recv(65535).decode("utf-8", "replace")
+            if chunk:
+                buf += chunk
+                quiet = 0.0
+                low = buf.lower()
+                if any(m in low for m in markers):
+                    break
+            else:
+                quiet += 0.5
+                if quiet >= idle:
+                    break
+        return buf
+
+    use_sftp = TRANSFER_MODE != "terminal"
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(device["host"], port=device.get("port", 22), username=device["username"], password=device["password"], timeout=10)
+
+        # --- Mode SFTP: upload file dulu, lalu `load merge <file>` (dari shell). ---
+        if use_sftp:
+            try:
+                sftp = client.open_sftp()
+                with sftp.open(remote_path, "w") as rf:
+                    rf.write(content if content.endswith("\n") else content + "\n")
+                sftp.close()
+                print(f"📤 Config terkirim via SFTP → {device['host']}:{remote_path}")
+            except Exception as e:
+                print(f"❌ ERROR: SFTP gagal ({e}). Pastikan `sftp-server` aktif atau set TRANSFER_MODE=terminal.")
+                client.close()
+                return False
+
+        channel = client.invoke_shell()
+        drain(channel, 1)  # buang banner login
+
+        # Matikan pager & wrap: cegah prompt `---(more)---` / baris terbungkus yang
+        # membuat penanda `load complete` tak terbaca.
+        channel.send("set cli screen-length 0\n")
+        channel.send("set cli screen-width 0\n")
+        drain(channel, 1)
+
+        channel.send("configure\n")
+        print(f"Output [configure]:\n{drain(channel)}")
+
+        for cmd in (pre_cmds or []):
+            channel.send(cmd + "\n")
+            print(f"Output [{cmd}]:\n{drain(channel)}")
+
+        if use_sftp:
+            # File sudah di perangkat → load langsung dari file (tanpa risiko paste).
+            load_cmd = f"load {load_kind} {remote_path}"
+            channel.send(load_cmd + "\n")
+        else:
+            # Mode terminal: kirim config BARIS DEMI BARIS. Mengirim seluruh blob
+            # sekaligus membanjiri buffer sesi → sebagian byte hilang → token kosong
+            # `''` & "syntax error". Per-baris + jeda kecil = flow-control sederhana.
+            load_cmd = f"load {load_kind} terminal"
+            channel.send(load_cmd + "\n")
+            drain(channel, 1)
+            for line in content.splitlines():
+                channel.send(line + "\n")
+                time.sleep(0.05)                 # beri perangkat waktu meng-echo
+                if channel.recv_ready():         # buang echo agar buffer tak menumpuk
+                    channel.recv(65535)
+            # Ctrl-D HARUS di awal baris kosong agar Junos mengakhiri input.
+            channel.send("\n")
+            time.sleep(1)
+            channel.send("\x04")
+
+        # Tunggu sampai Junos konfirmasi hasil load (atau diam) — bukan hitungan tetap.
+        load_out = read_until(channel, ["load complete", "error", "syntax error", "unknown command"])
+        print(f"Output [{load_cmd}]:\n{load_out}")
+
+        low = load_out.lower()
+        # Junos sukses selalu cetak "load complete". Bila ada 'error'/'syntax'/
+        # 'unknown', atau JUSTRU tak ada 'load complete' → anggap gagal & rollback.
+        if "error" in low or "syntax" in low or "unknown command" in low or "load complete" not in low:
+            print("⚠️  `load` gagal / tak konfirmasi 'load complete' — rollback, tanpa commit.")
+            channel.send("rollback\n")
+            print(f"Output [rollback]:\n{drain(channel)}")
+            channel.send("exit\n")
+            drain(channel, 1)
+            channel.close()
+            client.close()
+            return False
+
+        # `commit check` dulu (validasi tanpa apply). Bila gagal → rollback, tak
+        # commit. `commit confirmed 5` = jaring pengaman: bila `commit` konfirmasi
+        # berikutnya gagal terkirim, Junos auto-rollback dalam 5 menit sehingga
+        # Backup tak tertinggal dalam kondisi setengah jadi.
+        channel.send("show | compare\n")
+        print(f"Output [show | compare]:\n{read_until(channel, ['[edit]'])}")
+
+        channel.send("commit check\n")
+        check_out = read_until(channel, ["configuration check succeeds", "check-out failed", "error"])
+        print(f"Output [commit check]:\n{check_out}")
+        if "error" in check_out.lower() or "check-out failed" in check_out.lower():
+            print("⚠️  `commit check` gagal — rollback, tanpa commit.")
+            channel.send("rollback\n")
+            print(f"Output [rollback]:\n{drain(channel)}")
+            channel.send("exit\n")
+            drain(channel, 1)
+            channel.close()
+            client.close()
+            return False
+
+        channel.send("commit confirmed 5\n")
+        print(f"Output [commit confirmed 5]:\n{read_until(channel, ['commit confirmed', 'commit complete', 'error'])}")
+        channel.send("commit\n")
+        print(f"Output [commit]:\n{read_until(channel, ['commit complete', 'error'])}")
+        channel.send("exit\n")
+        drain(channel, 1)
+
+        channel.close()
+        client.close()
+        return True
+    except Exception as e:
+        print(f"❌ ERROR: Failed to push config via terminal to {device['host']}: {e}")
+        return False
 
 
 def ssh_interactive(device, commands):
@@ -234,77 +354,6 @@ def ssh_interactive(device, commands):
         client.close()
     except Exception as e:
         print(f"❌ ERROR: Failed to run interactive session: {e}")
-
-
-def sftp_put(device, local_path, remote_path):
-    """Kirim satu file lokal ke perangkat via SFTP. Return True bila sukses."""
-    try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(device["host"], port=device.get("port", 22), username=device["username"], password=device["password"], timeout=10)
-        sftp = client.open_sftp()
-        sftp.put(local_path, remote_path)
-        sftp.close()
-        client.close()
-        return True
-    except Exception as e:
-        print(f"❌ ERROR: Failed to SFTP file to {device['host']}: {e}")
-        return False
-
-
-def apply_patch_to_backup(device, remote_path, mode_label):
-    """Terapkan patch delta di Backup via `load patch`, dengan branching aman.
-
-    Beda dari `ssh_interactive` (kirim semua command sekaligus): di sini kita
-    membaca output `load patch` DULU. Bila konteks Backup drift, `load patch`
-    menolak dengan `error:` — kita `rollback` & keluar TANPA commit, lalu return
-    False agar pemanggil bisa fallback ke `load merge` full.
-
-    Return True bila patch diterapkan & di-commit; False bila gagal (tak commit).
-    """
-    def drain(channel, wait=2):
-        """Tunggu sebentar lalu baca semua output yang tersedia."""
-        time.sleep(wait)
-        buf = ""
-        while channel.recv_ready():
-            buf += channel.recv(65535).decode("utf-8")
-        return buf
-
-    try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(device["host"], port=device.get("port", 22), username=device["username"], password=device["password"], timeout=10)
-        channel = client.invoke_shell()
-        drain(channel, 1)  # buang banner login
-
-        channel.send("configure\n")
-        print(f"Output [configure]:\n{drain(channel)}")
-
-        channel.send(f"load patch {remote_path}\n")
-        load_out = drain(channel)
-        print(f"Output [load patch]:\n{load_out}")
-
-        if "error" in load_out.lower():
-            # Patch ditolak (konteks tak cocok) → bersihkan & keluar tanpa commit.
-            print("⚠️  `load patch` ditolak (Backup drift?) — rollback, akan fallback ke load merge.")
-            channel.send("rollback\n")
-            print(f"Output [rollback]:\n{drain(channel)}")
-            channel.send("exit\n")
-            drain(channel, 1)
-            channel.close()
-            client.close()
-            return False
-
-        for cmd in ["show | compare", "commit confirmed 5", "commit", "exit"]:
-            channel.send(cmd + "\n")
-            print(f"Output [{cmd}]:\n{drain(channel)}")
-
-        channel.close()
-        client.close()
-        return True
-    except Exception as e:
-        print(f"❌ ERROR: Failed to apply patch ({mode_label}) to Backup: {e}")
-        return False
 
 
 def get_latest_commit(device):
@@ -446,11 +495,16 @@ def auto_sync(interval, daily_time):
 
 
 if __name__ == "__main__":
-    # `python sync-juniper.py`             → sync sekali lalu keluar
+    # `python sync-juniper.py`             → sync sekali (aditif: load merge, TANPA delete)
+    # `python sync-juniper.py --full`      → MIRROR sekali (delete logical-systems + load merge)
     # `python sync-juniper.py --watch [N]` → pantau, sync otomatis tiap Master commit
     # `python sync-juniper.py --every [N]` → sync PERIODIK tiap N dtk (default 3600 = 1 jam)
     # `python sync-juniper.py --auto [N]`  → commit-trigger + jadwal harian jam tetap (DAILY_SYNC_TIME)
-    if len(sys.argv) > 1 and sys.argv[1] in ("--watch", "-w"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("--full", "-f"):
+        # Mirror penuh: hapus logical-systems lama di Backup lalu muat ulang dari
+        # Master. Menghilangkan sisa config lama & risiko double/konflik merge.
+        sync_config(full=True)
+    elif len(sys.argv) > 1 and sys.argv[1] in ("--watch", "-w"):
         interval = int(sys.argv[2]) if len(sys.argv) > 2 else int(os.getenv("WATCH_INTERVAL", "30"))
         watch_and_sync(interval)
     elif len(sys.argv) > 1 and sys.argv[1] in ("--every", "-e"):

@@ -43,3 +43,13 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 #   "merge"           → perilaku lama: kirim seluruh stanza logical-systems
 #                       lalu `load merge` (aditif).
 COMMIT_TRIGGER_MODE = os.getenv("COMMIT_TRIGGER_MODE", "patch").strip().lower()
+
+# Cara mengirim config ke Backup:
+#   "sftp"     (default) → upload file via SFTP lalu `load merge <file>`.
+#                          Paling andal untuk config besar (tak ada korupsi
+#                          paste). Butuh `set system services ssh sftp-server`
+#                          aktif di Backup.
+#   "terminal"           → paste isi config ke sesi SSH via `load merge
+#                          terminal` (baris demi baris). Dipakai bila SFTP tak
+#                          tersedia; tak butuh subsystem sftp-server.
+TRANSFER_MODE = os.getenv("TRANSFER_MODE", "sftp").strip().lower()
