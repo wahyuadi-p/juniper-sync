@@ -208,9 +208,9 @@ activate/deactivate status, and exclusions in both `all` and `state` scope.
 
 | Package | Version | Purpose |
 |---|---|---|
-| `paramiko` | 3.5.0 | SSH and SFTP connectivity to Juniper devices |
+| `paramiko` | 5.0.0 | SSH and SFTP connectivity to Juniper devices |
 | `requests` | 2.33.1 | Sending Telegram API notifications |
-| `python-dotenv` | optional | `.env` loading (a zero-dependency fallback parser is built in) |
+| `python-dotenv` | 1.0.1 | `.env` loading (a zero-dependency fallback parser is built in if absent) |
 
 ## ⚠️ Known Limitations
 
