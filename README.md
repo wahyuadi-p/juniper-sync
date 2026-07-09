@@ -31,7 +31,7 @@ The tool offers several strategies, each suited to a different situation:
 
 | Mode | CLI | What it does |
 |---|---|---|
-| **Merge** (additive) | `python sync-juniper.py` | Fetch Master's `logical-systems`, `load merge` into Backup. Additions/changes flow in, but items **deleted** on the Master do **not** disappear on the Backup. |
+| **Merge** (additive) | `python3 sync-juniper.py` | Fetch Master's `logical-systems`, `load merge` into Backup. Additions/changes flow in, but items **deleted** on the Master do **not** disappear on the Backup. |
 | **Full mirror** | `--full` / `-f` | `delete logical-systems` + `load merge`. Backup becomes an exact mirror of the Master's `logical-systems` (deletions are reflected). Names in `PRESERVE_LOGICAL_SYSTEMS` are kept. |
 | **Diff** (reconcile) | `--diff` / `-d` | Compare Master vs Backup as `set` lines, then **add** what is missing and **delete** what is extra on the Backup — honoring `EXCLUDE_FILE`. |
 | **Preview** | `--preview` / `-n` | Read-only. Computes and prints the diff plan (saved to `diff_apply.txt`) **without touching** the Backup. |
@@ -70,8 +70,8 @@ Polls the Master and syncs automatically whenever a **new commit changes
 `logical-systems`** (no router-side setup required):
 
 ```bash
-python sync-juniper.py --watch          # poll every 30s (default)
-python sync-juniper.py --watch 10       # poll every 10s
+python3 sync-juniper.py --watch          # poll every 30s (default)
+python3 sync-juniper.py --watch 10       # poll every 10s
 # or set WATCH_INTERVAL=15 in .env
 ```
 
@@ -86,8 +86,8 @@ Runs a sync on a fixed schedule every N seconds, regardless of whether there is 
 new commit. Default 3600s = 1 hour:
 
 ```bash
-python sync-juniper.py --every          # every 3600s (1 hour, default)
-python sync-juniper.py --every 1800     # every 30 minutes
+python3 sync-juniper.py --every          # every 3600s (1 hour, default)
+python3 sync-juniper.py --every 1800     # every 30 minutes
 # or set SYNC_INTERVAL=3600 in .env
 ```
 
@@ -98,8 +98,8 @@ Combines **watch** with a daily scheduled sync at a fixed time (default midnight
 detected:
 
 ```bash
-python sync-juniper.py --auto           # poll commits every 30s + daily sync
-python sync-juniper.py --auto 10        # poll every 10s + daily sync
+python3 sync-juniper.py --auto           # poll commits every 30s + daily sync
+python3 sync-juniper.py --auto 10        # poll every 10s + daily sync
 # schedule via .env: DAILY_SYNC_TIME=00:00   (HH:MM, 24h)
 ```
 
@@ -156,7 +156,7 @@ juniper-sync/
 2. **Create a virtual environment** (optional)
 
    ```bash
-   python -m venv venv
+   python3 -m venv venv
    source venv/bin/activate
    ```
 
@@ -198,7 +198,7 @@ cp exclude.conf.example exclude.conf   # only needed for diff mode
 The core diff logic is pure (no SSH), so it is covered by unit tests:
 
 ```bash
-python test_diff.py     # exit 0 = all pass
+python3 test_diff.py     # exit 0 = all pass
 ```
 
 These exercise every case: adds, container-collapsed deletes, value changes,

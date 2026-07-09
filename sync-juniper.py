@@ -370,7 +370,7 @@ def sync_config(full=False):
         # kegagalan kirim Telegram (server tanpa internet, dll.) TAK BOLEH bikin
         # program crash. check=False + try/except → cukup warning.
         try:
-            subprocess.run(["python", "notif.py"], check=False)
+            subprocess.run([sys.executable, "notif.py"], check=False)
         except Exception as e:
             print(f"⚠️  Notifikasi dilewati (gagal jalankan notif.py): {e}")
     else:
@@ -417,7 +417,7 @@ def sync_config_commit_trigger():
         # kegagalan kirim Telegram (server tanpa internet, dll.) TAK BOLEH bikin
         # program crash. check=False + try/except → cukup warning.
         try:
-            subprocess.run(["python", "notif.py"], check=False)
+            subprocess.run([sys.executable, "notif.py"], check=False)
         except Exception as e:
             print(f"⚠️  Notifikasi dilewati (gagal jalankan notif.py): {e}")
     else:
@@ -488,7 +488,7 @@ def sync_config_diff(dry_run=False):
     if push_config(BACKUP, "set", batch):
         print("✅ Rekonsiliasi diff selesai — Backup kini selaras Master (di luar pengecualian).")
         try:
-            subprocess.run(["python", "notif.py"], check=False)
+            subprocess.run([sys.executable, "notif.py"], check=False)
         except Exception as e:
             print(f"⚠️  Notifikasi dilewati (gagal jalankan notif.py): {e}")
     else:
@@ -869,13 +869,13 @@ def auto_sync(interval, daily_time):
 
 
 if __name__ == "__main__":
-    # `python sync-juniper.py`             → sync sekali (aditif: load merge, TANPA delete)
-    # `python sync-juniper.py --full`      → MIRROR sekali (delete logical-systems + load merge)
-    # `python sync-juniper.py --diff`      → REKONSILIASI: tambah yg kurang + hapus yg berlebih (hormati EXCLUDE_FILE)
-    # `python sync-juniper.py --preview`   → PREVIEW diff (baca-saja, tak mengubah Backup)
-    # `python sync-juniper.py --watch [N]` → pantau, sync otomatis tiap Master commit
-    # `python sync-juniper.py --every [N]` → sync PERIODIK tiap N dtk (default 3600 = 1 jam)
-    # `python sync-juniper.py --auto [N]`  → commit-trigger + jadwal harian jam tetap (DAILY_SYNC_TIME)
+    # `python3 sync-juniper.py`             → sync sekali (aditif: load merge, TANPA delete)
+    # `python3 sync-juniper.py --full`      → MIRROR sekali (delete logical-systems + load merge)
+    # `python3 sync-juniper.py --diff`      → REKONSILIASI: tambah yg kurang + hapus yg berlebih (hormati EXCLUDE_FILE)
+    # `python3 sync-juniper.py --preview`   → PREVIEW diff (baca-saja, tak mengubah Backup)
+    # `python3 sync-juniper.py --watch [N]` → pantau, sync otomatis tiap Master commit
+    # `python3 sync-juniper.py --every [N]` → sync PERIODIK tiap N dtk (default 3600 = 1 jam)
+    # `python3 sync-juniper.py --auto [N]`  → commit-trigger + jadwal harian jam tetap (DAILY_SYNC_TIME)
     if len(sys.argv) > 1 and sys.argv[1] in ("--full", "-f"):
         # Mirror penuh: hapus logical-systems lama di Backup lalu muat ulang dari
         # Master. Menghilangkan sisa config lama & risiko double/konflik merge.
