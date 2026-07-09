@@ -4,9 +4,10 @@ import subprocess
 import hashlib
 import sys
 import os
+import re
 from datetime import datetime
 
-from config import MASTER, BACKUP, COMMIT_TRIGGER_MODE, TRANSFER_MODE   # kredensial & opsi dari .env (bukan hardcoded)
+from config import MASTER, BACKUP, COMMIT_TRIGGER_MODE, TRANSFER_MODE, PRESERVE_LOGICAL_SYSTEMS, EXCLUDE_FILE   # kredensial & opsi dari .env (bukan hardcoded)
 
 # Windows: console default cp1252 → emoji bikin UnicodeEncodeError. Paksa UTF-8.
 try:
@@ -75,6 +76,215 @@ def fetch_logical_systems_patch(device):
     return out.strip()
 
 
+def fetch_logical_system_names(device):
+    """Ambil daftar NAMA top-level `logical-systems` dari perangkat (via display set).
+
+    `show configuration logical-systems | display set` mencetak baris seperti
+    `set logical-systems BGP-SCRIPT ...` dan `deactivate logical-systems BGP-SCRIPT`.
+    Nama = token ke-3, unik & urut kemunculan. LS yang di-deactivate tetap muncul
+    (lewat baris `set`/`deactivate`), jadi ikut terdeteksi.
+
+    Return:
+        list[str] → daftar nama LS (bisa kosong bila Backup tak punya LS)
+        None      → gagal koneksi ke perangkat
+    """
+    out = ssh_command(device, "show configuration logical-systems | display set | no-more")
+    if out is None:
+        return None
+    names = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] in ("set", "deactivate") and parts[1] == "logical-systems":
+            if parts[2] not in names:
+                names.append(parts[2])
+    return names
+
+
+# ---------------------------------------------------------------------------
+# MODE DIFF (rekonsiliasi): bandingkan `logical-systems` Master vs Backup dalam
+# bentuk `set`-command, lalu TAMBAH yang kurang & HAPUS yang berlebih di Backup.
+# File pengecualian (EXCLUDE_FILE) melindungi path tertentu (mis. LS standby yang
+# di-deactivate) agar tak pernah ditambah/dihapus.
+# ---------------------------------------------------------------------------
+
+_SET_VERBS = ("set", "delete", "activate", "deactivate", "annotate")
+
+
+def _split_verb(line):
+    """Pisah verb Junos di depan baris `display set` dari sisanya (path).
+
+    'set logical-systems X ...' → ('set', 'logical-systems X ...').
+    Bila token pertama bukan verb → (None, line).
+    """
+    head, _, rest = line.partition(" ")
+    if head in _SET_VERBS and rest:
+        return head, rest
+    return None, line
+
+
+def fetch_set_config(device):
+    """Ambil `logical-systems` sebagai daftar baris `set` (via display set).
+
+    Return:
+        list[str] → baris `set/deactivate/...` (tanpa baris kosong)
+        None      → gagal koneksi
+    """
+    out = ssh_command(device, "show configuration logical-systems | display set | no-more")
+    if out is None:
+        return None
+    return [ln.rstrip() for ln in out.splitlines() if ln.strip()]
+
+
+def load_exclude_patterns(path):
+    """Baca file pengecualian → daftar (scope, prefix). Verb di depan menentukan SCOPE.
+
+    Tiap baris berisi PREFIX path; verb di depan opsional & menentukan cakupan:
+      - verb `activate`/`deactivate` → scope "state": HANYA status aktif/nonaktif
+        path itu yang dilindungi. ISI-nya (baris `set`/`delete`) TETAP disinkron
+        ke Master. Gunakan ini agar LS ikut update config tapi tak pernah
+        di-(non)aktifkan (mis. BGP-SCRIPT standby yang di-deactivate VRRP).
+      - tanpa verb, atau verb `set`/`delete`/`annotate` → scope "all": SELURUH
+        path (isi maupun status) tak pernah ditambah/dihapus (perilaku lama).
+
+    Baris kosong / diawali `#` diabaikan. File tak ada → daftar kosong.
+    """
+    patterns = []
+    if not path or not os.path.exists(path):
+        return patterns
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            verb, rest = _split_verb(s)       # verb opsional; menentukan scope
+            scope = "state" if verb in ("activate", "deactivate") else "all"
+            patterns.append((scope, rest))
+    return patterns
+
+
+def _is_excluded(verb, path, patterns):
+    """True bila baris (verb, path) dilindungi salah satu pola pengecualian.
+
+    scope "all"   → dilindungi bila `path` == pola atau berada DI BAWAHnya,
+                    apa pun verb-nya (isi & status sama-sama tak disentuh).
+    scope "state" → dilindungi HANYA bila verb `activate`/`deactivate` DAN path
+                    cocok — sehingga perubahan ISI (`set`/`delete`) tetap lolos
+                    dan ikut disinkron, cuma status aktif/nonaktif yang dijaga.
+    """
+    for scope, p in patterns:
+        if path == p or path.startswith(p + " "):
+            if scope == "all":
+                return True
+            if scope == "state" and verb in ("activate", "deactivate"):
+                return True
+    return False
+
+
+def _collapse_deletes(del_paths, master_paths, patterns):
+    """Runtuhkan sekumpulan `delete <leaf>` ke `delete <container>` tertinggi yang aman.
+
+    `display set` mencetak per-LEAF, jadi menghapus leaf satu-per-satu bisa melewati
+    state INVALID di tengah jalan — mis. `delete peer-as` lalu neighbor eksternal
+    tersisa tanpa peer-as → `commit check` ditolak. Master sendiri menghapus lewat
+    satu `delete <container>` yang atomik, sehingga tak pernah invalid. Fungsi ini
+    meniru itu: tiap leaf dinaikkan ke container LELUHUR TERTINGGI yang boleh dihapus
+    utuh, lalu satu `delete <container>` menggantikan semua leaf di bawahnya.
+
+    Sebuah container C aman diruntuhkan bila:
+      - Master tak punya apa pun di/di bawah C (C memang harus lenyap seluruhnya), DAN
+      - tak ada pola pengecualian di/di bawah C (jangan menelan subtree yang dijaga —
+        termasuk status deactivate LS yang di-exclude scope `state`).
+    Karena Master selalu punya isi di bawah `logical-systems`, C tak akan pernah
+    naik sampai menghapus seluruh stanza.
+
+    Args:
+        del_paths    : list path (verb sudah dibuang) dari baris `set` Backup yg dihapus.
+        master_paths : set path (verb dibuang) yang ADA di Master.
+        patterns     : list (scope, prefix) dari load_exclude_patterns.
+    Return:
+        list[str] → perintah `delete <container>`, sudah didedup (tanpa anak-di-bawah-induk).
+    """
+    def master_has_under(c):
+        return any(mp == c or mp.startswith(c + " ") for mp in master_paths)
+
+    def exclude_under(c):
+        return any(p == c or p.startswith(c + " ") for _scope, p in patterns)
+
+    chosen = []
+    for path in del_paths:
+        toks = path.split(" ")
+        container = path                           # default: hapus leaf itu sendiri
+        for i in range(1, len(toks)):              # prefiks terpendek→terpanjang; ambil yg pertama aman
+            c = " ".join(toks[:i])
+            if not master_has_under(c) and not exclude_under(c):
+                container = c
+                break
+        if container not in chosen:
+            chosen.append(container)
+
+    # Dedup hierarkis: buang container yang berada DI BAWAH container lain yang sudah dipilih.
+    kept = []
+    for c in sorted(chosen, key=lambda s: len(s.split(" "))):   # induk (lebih pendek) dulu
+        if any(c == k or c.startswith(k + " ") for k in kept):
+            continue
+        kept.append(c)
+    return ["delete " + c for c in kept]
+
+
+def compute_diff(master_lines, backup_lines, patterns):
+    """Hitung perintah rekonsiliasi agar Backup == Master (di luar pengecualian).
+
+    Return (adds, removes):
+      adds    : baris Master yang belum ada di Backup → diterapkan apa adanya
+                (`set`/`activate`/`deactivate`).
+      removes : baris Backup yang tak ada di Master → dikonversi jadi lawannya.
+                Penghapusan `set`→`delete` DIRUNTUHKAN ke container tertinggi yang
+                aman (lihat `_collapse_deletes`) supaya atomik & tak melewati state
+                invalid. `deactivate`→`activate`, `activate`→`deactivate` tetap
+                per-baris (perubahan status, bukan struktur).
+    Baris yang path-nya cocok pengecualian dilewati di KEDUA arah.
+    """
+    mset = set(master_lines)
+    bset = set(backup_lines)
+    master_paths = {_split_verb(ln)[1] for ln in master_lines}
+    adds = []
+    del_paths, state_cmds = [], []
+
+    for ln in master_lines:                        # ada di Master, tak ada di Backup → tambah
+        if ln in bset:
+            continue
+        verb, path = _split_verb(ln)
+        if _is_excluded(verb, path, patterns):
+            continue
+        adds.append(ln)
+
+    for ln in backup_lines:                        # ada di Backup, tak ada di Master → hapus
+        if ln in mset:
+            continue
+        verb, path = _split_verb(ln)
+        if _is_excluded(verb, path, patterns):
+            continue
+        if verb == "set":
+            del_paths.append(path)                 # dikumpulkan → diruntuhkan ke container
+        elif verb == "deactivate":
+            state_cmds.append("activate " + path)  # samakan ke Master (aktif)
+        elif verb == "activate":
+            state_cmds.append("deactivate " + path)
+        # annotate / tak dikenal → dilewati (tak diutak-atik)
+
+    deletes = _collapse_deletes(del_paths, master_paths, patterns)
+
+    # Buang perintah status yang path-nya sudah tercakup oleh sebuah `delete <container>`
+    # (containernya lenyap → activate/deactivate di bawahnya jadi mubazir & error).
+    del_containers = [c[len("delete "):] for c in deletes]
+    state_cmds = [
+        s for s in state_cmds
+        if not any(_split_verb(s)[1] == c or _split_verb(s)[1].startswith(c + " ") for c in del_containers)
+    ]
+
+    return adds, deletes + state_cmds
+
+
 def validate_config(config):
     """Validate the configuration format (kurung buka/tutup seimbang)."""
     open_braces = config.count("{")
@@ -128,7 +338,30 @@ def sync_config(full=False):
     #   full=False → load merge saja (aditif; hapusan di Master tak ikut)
     # commit confirmed 5 = jaring pengaman (auto-rollback dalam 5 menit bila
     # `commit` konfirmasi tak dijalankan).
-    pre_cmds = ["delete logical-systems"] if full else []
+    pre_cmds = []
+    if full:
+        if PRESERVE_LOGICAL_SYSTEMS:
+            # Mode mirror, TAPI ada LS yang khusus Backup (di-preserve). Hapus-buta
+            # `delete logical-systems` akan ikut menghapusnya, jadi ambil daftar LS
+            # Backup lalu hapus PER-NAMA kecuali yang di-preserve → isi & status
+            # deactivate LS itu tetap utuh.
+            names = fetch_logical_system_names(BACKUP)
+            if names is None:
+                print("❌ Gagal baca daftar `logical-systems` Backup — full sync dibatalkan (hindari delete buta).")
+                return
+            kept = [n for n in names if n in PRESERVE_LOGICAL_SYSTEMS]
+            pre_cmds = [f"delete logical-systems {n}" for n in names if n not in PRESERVE_LOGICAL_SYSTEMS]
+            print("🔒 Preserve: " + ", ".join(PRESERVE_LOGICAL_SYSTEMS)
+                  + (f" — dipertahankan di Backup: {', '.join(kept)}" if kept else " — belum ada di Backup saat ini"))
+            # Pengaman: bila Master ternyata PUNYA stanza bernama sama, `load merge`
+            # akan menimpanya (bisa meng-aktifkan kembali) → bentrok. Peringatkan,
+            # jangan diam-diam.
+            clash = [n for n in PRESERVE_LOGICAL_SYSTEMS if re.search(rf"(?m)^\s*{re.escape(n)}\s*\{{", ls)]
+            if clash:
+                print(f"⚠️  PERINGATAN: {', '.join(clash)} juga ada di config Master — "
+                      "`load merge` bisa menimpa/mengaktifkannya kembali. Periksa manual!")
+        else:
+            pre_cmds = ["delete logical-systems"]
     print(f"🛠 Applying `logical-systems` ({mode}) via {TRANSFER_MODE}...")
     if push_config(BACKUP, "merge", final_config, pre_cmds):
         print("✅ `logical-systems` synchronization completed successfully!")
@@ -137,7 +370,7 @@ def sync_config(full=False):
         # kegagalan kirim Telegram (server tanpa internet, dll.) TAK BOLEH bikin
         # program crash. check=False + try/except → cukup warning.
         try:
-            subprocess.run(["python3", "notif.py"], check=False)
+            subprocess.run(["python", "notif.py"], check=False)
         except Exception as e:
             print(f"⚠️  Notifikasi dilewati (gagal jalankan notif.py): {e}")
     else:
@@ -152,8 +385,13 @@ def sync_config_commit_trigger():
     `load patch` ditolak (Backup drift) → fallback ke `sync_config(full=False)`
     (kirim seluruh stanza + `load merge`, aditif) yang lebih tahan drift.
 
-    Bila COMMIT_TRIGGER_MODE != "patch", langsung pakai perilaku lama (merge).
+    Bila COMMIT_TRIGGER_MODE == "diff" → rekonsiliasi diff Master↔Backup.
+    Bila COMMIT_TRIGGER_MODE != "patch"/"diff" → perilaku lama (merge).
     """
+    if COMMIT_TRIGGER_MODE == "diff":
+        print("⚙️  COMMIT_TRIGGER_MODE=diff → rekonsiliasi diff Master↔Backup.")
+        sync_config_diff()
+        return
     if COMMIT_TRIGGER_MODE != "patch":
         print(f"⚙️  COMMIT_TRIGGER_MODE={COMMIT_TRIGGER_MODE} → pakai load merge (perilaku lama).")
         sync_config(full=False)
@@ -179,7 +417,7 @@ def sync_config_commit_trigger():
         # kegagalan kirim Telegram (server tanpa internet, dll.) TAK BOLEH bikin
         # program crash. check=False + try/except → cukup warning.
         try:
-            subprocess.run(["python3", "notif.py"], check=False)
+            subprocess.run(["python", "notif.py"], check=False)
         except Exception as e:
             print(f"⚠️  Notifikasi dilewati (gagal jalankan notif.py): {e}")
     else:
@@ -187,10 +425,80 @@ def sync_config_commit_trigger():
         sync_config(full=False)
 
 
+def sync_config_diff(dry_run=False):
+    """Rekonsiliasi `logical-systems`: buat Backup == Master, hormati pengecualian.
+
+    Ambil config kedua perangkat sebagai baris `set`, hitung selisih, lalu:
+      - TAMBAH baris Master yang belum ada di Backup (`set …`),
+      - HAPUS baris Backup yang tak ada di Master (`delete …`).
+    Path yang cocok EXCLUDE_FILE tak pernah ditambah/dihapus (mis. LS standby yang
+    di-deactivate & hanya ada di Backup). Diterapkan via `load set` dengan seluruh
+    jaring pengaman commit yang sama (commit check → commit confirmed 5 → commit).
+
+    dry_run=True → HANYA cetak & simpan rencana diff (baca-saja, TAK menyentuh
+    Backup). Dipakai untuk preview/verifikasi sebelum benar-benar apply.
+    """
+    print("🔍 Menghitung DIFF `logical-systems` (Master vs Backup)"
+          + (" [PREVIEW — tak mengubah apa pun]..." if dry_run else "..."))
+    m = fetch_set_config(MASTER)
+    b = fetch_set_config(BACKUP)
+    if m is None:
+        print("❌ Gagal baca config Master.")
+        return
+    if b is None:
+        print("❌ Gagal baca config Backup.")
+        return
+    if not m:
+        print("⚠️  Master tak punya `logical-systems` — dibatalkan (hindari hapus massal Backup).")
+        return
+
+    print(f"   Master: {len(m)} baris set  |  Backup: {len(b)} baris set")
+    patterns = load_exclude_patterns(EXCLUDE_FILE)
+    if patterns:
+        # Tampilkan scope tiap pola: [state]=lindungi status saja, [all]=lindungi seluruhnya.
+        shown = ", ".join(f"{p} [{scope}]" for scope, p in patterns)
+        print(f"🔒 Pengecualian ({EXCLUDE_FILE}): {len(patterns)} pola → {shown}")
+    else:
+        print(f"ℹ️  Tanpa pengecualian (file '{EXCLUDE_FILE}' kosong/tak ada).")
+
+    adds, removes = compute_diff(m, b, patterns)
+    if not adds and not removes:
+        print("✅ Backup sudah sinkron dengan Master (di luar pengecualian). Tak ada perubahan.")
+        return
+
+    print(f"➕ Tambah {len(adds)} baris   ➖ Hapus {len(removes)} baris:")
+    for c in removes:
+        print("   -", c)
+    for c in adds:
+        print("   +", c)
+
+    # Terapkan HAPUS dulu baru TAMBAH: bila sebuah leaf berganti nilai, hapus nilai
+    # lama sebelum set nilai baru agar `delete … <nilai-lama>` masih cocok.
+    batch = "\n".join(removes + adds) + "\n"
+
+    # Salinan lokal untuk audit/debug.
+    with open("diff_apply.txt", "w", encoding="utf-8") as f:
+        f.write(batch)
+
+    if dry_run:
+        print("👀 PREVIEW selesai — rencana disimpan ke diff_apply.txt. TAK ada yang dikirim ke Backup.")
+        return
+
+    print(f"🛠 Menerapkan diff via `load set` ({TRANSFER_MODE})...")
+    if push_config(BACKUP, "set", batch):
+        print("✅ Rekonsiliasi diff selesai — Backup kini selaras Master (di luar pengecualian).")
+        try:
+            subprocess.run(["python", "notif.py"], check=False)
+        except Exception as e:
+            print(f"⚠️  Notifikasi dilewati (gagal jalankan notif.py): {e}")
+    else:
+        print("❌ ERROR: Gagal menerapkan diff ke Backup.")
+
+
 def push_config(device, load_kind, content, pre_cmds=None, remote_path="/var/tmp/juniper_sync_load.txt"):
     """Kirim & terapkan config ke perangkat, via SFTP atau terminal (TRANSFER_MODE).
 
-    load_kind : "merge" atau "patch".
+    load_kind : "merge", "patch", atau "set" (baris set/delete/activate/deactivate).
     content   : teks config/patch yang akan di-load.
     pre_cmds  : perintah configure sebelum load (mis. ["delete logical-systems"]).
     remote_path: path file di perangkat saat mode SFTP.
@@ -501,9 +809,15 @@ def auto_sync(interval, daily_time):
     - Tiap `interval` detik, cek commit baru di Master → sync bila `logical-systems`
       berubah (persis seperti --watch).
     - Sekali sehari, begitu jam sistem melewati `daily_time` (format HH:MM, default
-      00:00 / tengah malam), paksa full sync sebagai jaring pengaman meski tak ada
+      00:00 / tengah malam), paksa sync sebagai jaring pengaman meski tak ada
       commit baru. Jam bisa diubah kapan saja lewat .env (DAILY_SYNC_TIME) tanpa
       ubah kode.
+
+    Metode jadwal harian mengikuti COMMIT_TRIGGER_MODE agar KONSISTEN dgn trigger:
+      - "diff" → `sync_config_diff()` (rekonsiliasi, hormati EXCLUDE_FILE).
+      - selain itu → `sync_config(full=True)` (full mirror: delete + load merge).
+    Tanpa ini, jadwal harian full-mirror bisa menggilas proteksi exclude (mis.
+    status deactivate LS scope `state`) yang dijaga mode diff sepanjang hari.
     """
     hour, minute = parse_daily_time(daily_time)
     print(f"🤖 Auto-sync aktif — commit-trigger tiap {interval} dtk + jadwal harian jam {hour:02d}:{minute:02d}. Ctrl+C untuk berhenti.")
@@ -520,8 +834,12 @@ def auto_sync(interval, daily_time):
             # --- Jadwal harian jam tetap (jaring pengaman) ---
             scheduled_today = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
             if now >= scheduled_today and last_daily_sync_date != now.date():
-                print(f"⏰ Jadwal harian ({hour:02d}:{minute:02d}) tercapai — full sync (delete + load merge)...")
-                sync_config(full=True)
+                if COMMIT_TRIGGER_MODE == "diff":
+                    print(f"⏰ Jadwal harian ({hour:02d}:{minute:02d}) tercapai — rekonsiliasi diff (hormati exclude)...")
+                    sync_config_diff()
+                else:
+                    print(f"⏰ Jadwal harian ({hour:02d}:{minute:02d}) tercapai — full sync (delete + load merge)...")
+                    sync_config(full=True)
                 last_daily_sync_date = now.date()
                 last_commit = get_latest_commit(MASTER)
                 last_ls_hash = hashlib.sha256((fetch_logical_systems(MASTER) or "").encode()).hexdigest()
@@ -553,6 +871,8 @@ def auto_sync(interval, daily_time):
 if __name__ == "__main__":
     # `python sync-juniper.py`             → sync sekali (aditif: load merge, TANPA delete)
     # `python sync-juniper.py --full`      → MIRROR sekali (delete logical-systems + load merge)
+    # `python sync-juniper.py --diff`      → REKONSILIASI: tambah yg kurang + hapus yg berlebih (hormati EXCLUDE_FILE)
+    # `python sync-juniper.py --preview`   → PREVIEW diff (baca-saja, tak mengubah Backup)
     # `python sync-juniper.py --watch [N]` → pantau, sync otomatis tiap Master commit
     # `python sync-juniper.py --every [N]` → sync PERIODIK tiap N dtk (default 3600 = 1 jam)
     # `python sync-juniper.py --auto [N]`  → commit-trigger + jadwal harian jam tetap (DAILY_SYNC_TIME)
@@ -560,6 +880,13 @@ if __name__ == "__main__":
         # Mirror penuh: hapus logical-systems lama di Backup lalu muat ulang dari
         # Master. Menghilangkan sisa config lama & risiko double/konflik merge.
         sync_config(full=True)
+    elif len(sys.argv) > 1 and sys.argv[1] in ("--diff", "-d"):
+        # Rekonsiliasi diff: buat Backup selaras Master (tambah + hapus selisih),
+        # kecuali path yang terdaftar di EXCLUDE_FILE.
+        sync_config_diff()
+    elif len(sys.argv) > 1 and sys.argv[1] in ("--preview", "-n"):
+        # Preview diff (baca-saja): tampilkan rencana tambah/hapus tanpa apply.
+        sync_config_diff(dry_run=True)
     elif len(sys.argv) > 1 and sys.argv[1] in ("--watch", "-w"):
         interval = int(sys.argv[2]) if len(sys.argv) > 2 else int(os.getenv("WATCH_INTERVAL", "30"))
         watch_and_sync(interval)

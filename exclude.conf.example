@@ -1,0 +1,21 @@
+# File pengecualian mode DIFF (`--diff` / COMMIT_TRIGGER_MODE=diff).
+# Salin ke `exclude.conf` (atau set EXCLUDE_FILE di .env), lalu isi.
+#
+# Satu PREFIX path per baris. Config di Backup yang path-nya sama dengan / berada
+# di bawah prefix ini TIDAK akan pernah ditambah maupun dihapus oleh sync — isi
+# maupun status deactivate-nya dibiarkan apa adanya.
+#
+# Verb di depan (set/delete/deactivate) boleh ditulis, otomatis diabaikan.
+# Baris kosong atau diawali `#` juga diabaikan.
+#
+# Contoh: lindungi seluruh logical-system standby yang hanya ada di Backup
+# (mis. BGP-SCRIPT yang di-deactivate oleh event-policy VRRP):
+#
+# logical-systems BGP-SCRIPT
+#
+# Contoh: lindungi HANYA sub-bagian tertentu (bukan seluruh LS):
+#
+# logical-systems BGP-VRRP interfaces ge-0/0/0 unit 20
+
+deactivate logical-systems BGP-SCRIPT
+

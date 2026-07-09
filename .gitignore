@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 final_config.txt
 patch_config.txt
+diff_apply.txt
+exclude.conf

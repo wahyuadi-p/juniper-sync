@@ -1,59 +1,155 @@
 # Juniper Sync
 
-> ⚠️ **This project is currently under active development and intended for testing purposes only.**
+> ⚠️ **This project is under active development and intended for testing purposes only.**
 
-Automatically synchronize configuration from a **Master** Juniper device to a **Backup** Juniper device. The script fetches the running configuration from the Master, filters out specific sections (such as hostname and management interface), merges it with a mandatory base configuration for the Backup device, and applies it using `load override`. A Telegram notification is sent upon successful synchronization.
+Synchronize the **`logical-systems`** configuration from a **Master** Juniper device to a **Backup** Juniper device over SSH. Unlike a full `load override`, this tool touches **only** the `logical-systems` stanza — the Backup device's own base configuration (host-name, management interface, routing, etc.) is always left intact. A Telegram notification is sent on success.
 
 ## How It Works
 
 ```
-┌────────────┐       SSH        ┌─────────────┐
+┌────────────┐       SSH        ┌──────────────┐
 │   Master   │ ──────────────── │  This Script │
-│ (Juniper)  │  Fetch config    │  (Python)    │
+│ (Juniper)  │  Fetch config    │   (Python)   │
 └────────────┘                  └──────┬───────┘
-                                       │
-                          Filter config │ (remove hostname,
-                          ge-0/0/0)     │ merge mandatory config
-                                       │
+                                       │  logical-systems only
+                                       │  (merge / patch / diff)
                                        ▼
                                 ┌─────────────┐       Telegram
                                 │   Backup    │ ──────────────── 📩 Notification
-                                │  (Juniper)  │  load override
+                                │  (Juniper)  │  load + commit confirmed
                                 └─────────────┘
 ```
 
-### Synchronization Flow
+The Backup device is always applied through the same commit safety net:
+`load` → `show | compare` → `commit check` → `commit confirmed 5` → `commit`.
+If any step fails, the script rolls back and never commits, so the Backup is never
+left half-applied.
 
-1. **Fetch** — Retrieve running configuration from the Master device via SSH.
-2. **Filter** — Remove `host-name` and `ge-0/0/0` interface block from the fetched configuration.
-3. **Merge** — Combine the filtered configuration with a mandatory base configuration (hostname, management interface, static route, etc.) specific to the Backup device.
-4. **Validate** — Check that the final configuration has properly matched braces before applying.
-5. **Transfer** — Upload the final configuration file to the Backup device via SFTP.
-6. **Apply** — Execute `load override` and `commit confirmed` on the Backup device through an interactive SSH session.
-7. **Notify** — Send a Telegram notification upon successful synchronization.
+## Sync Modes
+
+The tool offers several strategies, each suited to a different situation:
+
+| Mode | CLI | What it does |
+|---|---|---|
+| **Merge** (additive) | `python sync-juniper.py` | Fetch Master's `logical-systems`, `load merge` into Backup. Additions/changes flow in, but items **deleted** on the Master do **not** disappear on the Backup. |
+| **Full mirror** | `--full` / `-f` | `delete logical-systems` + `load merge`. Backup becomes an exact mirror of the Master's `logical-systems` (deletions are reflected). Names in `PRESERVE_LOGICAL_SYSTEMS` are kept. |
+| **Diff** (reconcile) | `--diff` / `-d` | Compare Master vs Backup as `set` lines, then **add** what is missing and **delete** what is extra on the Backup — honoring `EXCLUDE_FILE`. |
+| **Preview** | `--preview` / `-n` | Read-only. Computes and prints the diff plan (saved to `diff_apply.txt`) **without touching** the Backup. |
+
+### Diff mode details
+
+Diff mode makes the Backup match the Master (outside of exclusions), in both
+directions:
+
+- **Add** — `set` lines present on the Master but missing on the Backup.
+- **Delete** — lines present on the Backup but absent on the Master. Nested
+  deletes are **collapsed to the highest safe container** (e.g. four leaf lines
+  under a BGP group become a single `delete ... group BGP-CORE`). This mirrors how
+  the Master itself deletes — atomically — so the Backup never passes through an
+  invalid intermediate state (such as an external neighbor left without a
+  `peer-as`, which `commit check` would reject).
+
+### Exclusions (`exclude.conf`)
+
+The diff mode reads an exclusion file (default `exclude.conf`, override via
+`EXCLUDE_FILE`). Each line is a path **prefix**; any Backup config at or below that
+prefix is protected. The **leading verb sets the protection scope**:
+
+| Line | Scope | Effect |
+|---|---|---|
+| `deactivate logical-systems BGP-SCRIPT` | `state` | Only the **activate/deactivate status** is protected. The stanza's **contents still sync** to the Master — useful for a standby LS that is deactivated by a VRRP event-policy but whose config must stay up to date. |
+| `logical-systems BGP-SCRIPT` | `all` | The **entire** path (contents **and** status) is never added or removed. |
+
+Blank lines and lines starting with `#` are ignored. See `exclude.conf.example`.
+
+## Continuous Modes
+
+### Watch — sync on Master commit
+
+Polls the Master and syncs automatically whenever a **new commit changes
+`logical-systems`** (no router-side setup required):
+
+```bash
+python sync-juniper.py --watch          # poll every 30s (default)
+python sync-juniper.py --watch 10       # poll every 10s
+# or set WATCH_INTERVAL=15 in .env
+```
+
+Each interval reads `show system commit`. When the top commit index changes **and**
+the `logical-systems` hash differs from the last sync, it triggers a sync. The
+baseline at startup is not synced (only subsequent commits trigger). Stop with
+`Ctrl+C`.
+
+### Every — periodic sync
+
+Runs a sync on a fixed schedule every N seconds, regardless of whether there is a
+new commit. Default 3600s = 1 hour:
+
+```bash
+python sync-juniper.py --every          # every 3600s (1 hour, default)
+python sync-juniper.py --every 1800     # every 30 minutes
+# or set SYNC_INTERVAL=3600 in .env
+```
+
+### Auto — commit-trigger + daily safety net
+
+Combines **watch** with a daily scheduled sync at a fixed time (default midnight
+`00:00`), so a full sync still happens once a day even if no new commit is
+detected:
+
+```bash
+python sync-juniper.py --auto           # poll commits every 30s + daily sync
+python sync-juniper.py --auto 10        # poll every 10s + daily sync
+# schedule via .env: DAILY_SYNC_TIME=00:00   (HH:MM, 24h)
+```
+
+**Both triggers follow `COMMIT_TRIGGER_MODE`** for consistency:
+
+| `COMMIT_TRIGGER_MODE` | Commit-trigger sends | Daily schedule runs |
+|---|---|---|
+| `diff` | `sync_config_diff()` — reconcile, honors `EXCLUDE_FILE` | `sync_config_diff()` — same |
+| `patch` (default) | delta only via `load patch` (`compare rollback 1`), auto-fallback to `load merge` on reject | full mirror (`delete` + `load merge`) |
+| `merge` | whole stanza + `load merge` (additive) | full mirror |
+
+> With `COMMIT_TRIGGER_MODE=diff`, exclusions are honored **around the clock** —
+> including at the daily run — so a `deactivate` state protected by scope `state`
+> is never overwritten.
+>
+> Note: `patch` mode's `rollback 1` captures only the **last** commit. If 2+
+> commits land between two polls, some delta may be missed on the patch path — this
+> is exactly what the daily full sync guards against.
+
+**Real-time alternatives (require router-side setup):**
+- **`event-options`** — an event policy on the Master triggers an op-script sync on `UI_COMMIT_COMPLETED`.
+- **Syslog** — the Master ships syslog to a host; a listener triggers on `UI_COMMIT_COMPLETED`.
+- **`transfer-on-commit`** — `set system archival configuration transfer-on-commit` uploads config on every commit; a file-watcher triggers the sync.
 
 ## Project Structure
 
 ```
 juniper-sync/
-├── sync-juniper.py     # Main synchronization script
-├── notif.py            # Telegram notification module
-└── requirements.txt    # Python dependencies
+├── sync-juniper.py       # Main synchronization script
+├── config.py             # Central config loader (reads .env)
+├── notif.py              # Telegram notification module
+├── test_diff.py          # Unit tests for the pure diff logic (no SSH)
+├── exclude.conf.example  # Sample exclusion file for diff mode
+├── .env.example          # Sample environment configuration
+└── requirements.txt      # Python dependencies
 ```
 
 ## Prerequisites
 
 - **Python** 3.8 or higher
-- **Network access** to both Master and Backup Juniper devices via SSH (port 22)
-- **Telegram Bot Token** and **Chat ID** for notifications
-- Both Juniper devices must have SSH enabled
+- **Network access** to both Master and Backup Juniper devices via SSH
+- A **Telegram Bot Token** and **Chat ID** for notifications (optional)
+- SSH enabled on both devices; `sftp-server` enabled on the Backup for SFTP transfer mode
 
 ## Installation
 
 1. **Clone the repository**
 
    ```bash
-   git clone https://github.com/your-username/juniper-sync.git
+   git clone https://github.com/wahyuadi-p/juniper-sync.git
    cd juniper-sync
    ```
 
@@ -72,135 +168,41 @@ juniper-sync/
 
 ## Configuration
 
-Before running the script, update the following variables directly in the source files:
-
-### `sync-juniper.py`
-
-| Variable | Description |
-|---|---|
-| `MASTER["host"]` | IP address of the Master Juniper device |
-| `MASTER["username"]` | SSH username for the Master device |
-| `MASTER["password"]` | SSH password for the Master device |
-| `BACKUP["host"]` | IP address of the Backup Juniper device |
-| `BACKUP["username"]` | SSH username for the Backup device |
-| `BACKUP["password"]` | SSH password for the Backup device |
-| `MANDATORY_CONFIG` | Base configuration to always apply on the Backup device (hostname, management interface, static route, syslog, etc.) |
-
-### `notif.py`
-
-| Variable | Description |
-|---|---|
-| `TELEGRAM_BOT_TOKEN` | Your Telegram Bot API token |
-| `TELEGRAM_CHAT_ID` | Target Telegram chat ID for notifications |
-
-## Usage
-
-Run the synchronization script once:
+All settings live in a `.env` file — **no credentials are hardcoded** in the
+source. Copy the sample and fill it in:
 
 ```bash
-python sync-juniper.py
+cp .env.example .env
+cp exclude.conf.example exclude.conf   # only needed for diff mode
 ```
 
-### Sync periodik (tiap 1 jam)
+### `.env` variables
 
-Mode **every**: skrip menjalankan sync **secara terjadwal** tiap N detik tanpa
-peduli ada commit baru atau tidak. Default 3600 detik = 1 jam:
+| Variable | Default | Description |
+|---|---|---|
+| `MASTER_HOST` / `MASTER_USER` / `MASTER_PASS` | — | Master device SSH host / username / password |
+| `MASTER_PORT` | `22` | Master SSH port |
+| `BACKUP_HOST` / `BACKUP_USER` / `BACKUP_PASS` | — | Backup device SSH host / username / password |
+| `BACKUP_PORT` | `22` | Backup SSH port |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | Telegram notification credentials |
+| `COMMIT_TRIGGER_MODE` | `patch` | `diff` \| `patch` \| `merge` (see [Auto](#auto--commit-trigger--daily-safety-net)) |
+| `TRANSFER_MODE` | `sftp` | `sftp` (upload then `load <file>`) or `terminal` (paste line by line) |
+| `PRESERVE_LOGICAL_SYSTEMS` | — | Comma-separated LS names kept during `--full` mirror (Backup-only standby LS) |
+| `EXCLUDE_FILE` | `exclude.conf` | Path to the diff-mode exclusion file |
+| `WATCH_INTERVAL` | `30` | `--watch` / `--auto` poll interval (seconds) |
+| `SYNC_INTERVAL` | `3600` | `--every` interval (seconds) |
+| `DAILY_SYNC_TIME` | `00:00` | `--auto` daily schedule (HH:MM, 24h) |
+
+## Testing
+
+The core diff logic is pure (no SSH), so it is covered by unit tests:
 
 ```bash
-python sync-juniper.py --every          # sync tiap 3600 dtk (1 jam, default)
-python sync-juniper.py --every 1800     # sync tiap 30 menit
-# atau atur lewat .env: SYNC_INTERVAL=3600
+python test_diff.py     # exit 0 = all pass
 ```
 
-Hentikan dengan `Ctrl+C`.
-
-### Auto-sync saat Master commit
-
-Mode **watch**: skrip memantau Master dan otomatis sync begitu ada **commit baru
-yang mengubah `logical-systems`** (tanpa perlu ubah konfigurasi router):
-
-```bash
-python sync-juniper.py --watch          # cek tiap 30 dtk (default)
-python sync-juniper.py --watch 10       # cek tiap 10 dtk
-# atau atur lewat .env: WATCH_INTERVAL=15
-```
-
-Cara kerja: tiap interval, skrip baca `show system commit`. Bila indeks commit
-teratas berubah **dan** hash `logical-systems` berbeda dari sync terakhir →
-jalankan sync. Baseline saat start tidak langsung disync (hanya commit
-berikutnya yang memicu). Hentikan dengan `Ctrl+C`.
-
-#### Commit-trigger mengirim DELTA saja (`load patch`)
-
-Saat commit-trigger (`--watch` / `--auto`) mendeteksi perubahan, yang dikirim ke
-Backup **hanya baris yang berubah** — bukan seluruh stanza `logical-systems`.
-Skrip mengambil delta dari Master via `show configuration logical-systems |
-compare rollback 1` (format patch, header absolut) lalu menerapkannya di Backup
-dengan `load patch`.
-
-Bila patch **ditolak** (konteks Backup sudah _drift_ dari Master), skrip otomatis
-**fallback** ke `load merge` full (kirim seluruh stanza, aditif) yang lebih tahan
-drift. Diatur lewat `.env`:
-
-```bash
-COMMIT_TRIGGER_MODE=patch   # default: kirim delta via load patch (+fallback merge)
-COMMIT_TRIGGER_MODE=merge   # perilaku lama: kirim seluruh stanza + load merge
-```
-
-> Catatan: `rollback 1` hanya menangkap **1 commit terakhir**. Bila ada 2+ commit
-> di antara dua polling, sebagian delta bisa terlewat di jalur patch — inilah
-> gunanya **jadwal harian full sync** (`--auto`) sebagai jaring pengaman.
-
-### Auto-sync gabungan (commit-trigger + jadwal harian jam tetap)
-
-Mode **auto**: gabungan mode **watch** di atas dengan jadwal sync harian di jam
-tetap (default tengah malam `00:00`) sebagai jaring pengaman — jadi tetap ada
-sync penuh sekali sehari meskipun tidak ada commit baru yang terdeteksi:
-
-```bash
-python sync-juniper.py --auto           # cek commit tiap 30 dtk (default) + sync jam 00:00
-python sync-juniper.py --auto 10        # cek commit tiap 10 dtk + sync jam 00:00
-# atau atur lewat .env: WATCH_INTERVAL=15
-```
-
-Jam sync harian diatur lewat `.env` (bisa diubah manual kapan saja, tanpa ubah kode):
-
-```bash
-DAILY_SYNC_TIME=00:00   # format HH:MM, 24 jam. Contoh lain: DAILY_SYNC_TIME=23:30
-```
-
-Cara kerja: tiap interval, skrip cek dua hal — (1) apakah jam sistem sudah
-melewati `DAILY_SYNC_TIME` dan belum sync di hari itu → jalankan full sync;
-kalau belum, (2) baru cek commit baru seperti mode `--watch`. Hentikan dengan
-`Ctrl+C`.
-
-**Alternatif real-time (butuh setelan di router):**
-- **`event-options`** — event policy di Master pada event `UI_COMMIT_COMPLETED` menjalankan op-script sync.
-- **Syslog** — Master kirim syslog ke host; listener memicu sync saat lihat `UI_COMMIT_COMPLETED`.
-- **`transfer-on-commit`** — `set system archival configuration transfer-on-commit` mengunggah config tiap commit; file-watcher di host memicu sync.
-
-### Expected Output
-
-```
-📥 Fetching configuration from Master...
-✅ Configuration validated successfully, sending to backup device...
-📤 Configuration file successfully sent to Backup device.
-🔍 Verifying file contents on Backup device...
-🛠 Applying configuration with `load override`...
-✅ Synchronization completed successfully!
-✅ Notification sent to Telegram!
-```
-
-## Filtered Configuration
-
-The script automatically **removes** the following sections from the Master configuration before applying to the Backup device:
-
-| Section | Reason |
-|---|---|
-| `host-name` | The Backup device must retain its own hostname |
-| `ge-0/0/0` interface block | Management interface must remain unique per device |
-
-These are then replaced by the `MANDATORY_CONFIG` block defined in the script.
+These exercise every case: adds, container-collapsed deletes, value changes,
+activate/deactivate status, and exclusions in both `all` and `state` scope.
 
 ## Dependencies
 
@@ -208,13 +210,14 @@ These are then replaced by the `MANDATORY_CONFIG` block defined in the script.
 |---|---|---|
 | `paramiko` | 3.5.0 | SSH and SFTP connectivity to Juniper devices |
 | `requests` | 2.33.1 | Sending Telegram API notifications |
+| `python-dotenv` | optional | `.env` loading (a zero-dependency fallback parser is built in) |
 
 ## ⚠️ Known Limitations
 
-- Credentials are currently **hardcoded** in the script (environment variables or a secrets manager are planned for future versions).
-- The `MANDATORY_CONFIG` block is **static** and must be manually updated if the Backup device configuration changes.
-- No **rollback mechanism** beyond Juniper's built-in `commit confirmed` timeout (5 minutes).
-- No **logging to file** — all output is printed to stdout.
+- `patch` mode's `rollback 1` only captures the last commit; the daily `--auto` sync compensates.
+- Diff mode reconciles `logical-systems` only — other stanzas on the Backup are never touched.
+- No **logging to file** — all output goes to stdout.
+- Rollback relies on Juniper's built-in `commit confirmed` timeout (5 minutes).
 
 ## License
 
